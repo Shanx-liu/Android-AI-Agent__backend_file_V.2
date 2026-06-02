@@ -1,0 +1,9 @@
+#Python編譯快取
+__pycache__/
+.env
+.vscode/
+*.docx
+~$*.docx
+*.pdf
+*.drawio
+*.drawio.bkp

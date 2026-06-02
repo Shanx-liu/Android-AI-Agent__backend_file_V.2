@@ -1,0 +1,3 @@
+Accessibility Service   (無障礙服務)
+MediaProjection 截圖服務
+常駐前景服務
