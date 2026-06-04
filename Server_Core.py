@@ -1,25 +1,6 @@
-#執行流程(範例)
-#           步驟	        |      負責人     |           狀態
-#1. 呼叫 wait_for_user	    |  Agent 節點	  |   self.pending 被建立，Agent 進入休眠等待。
-#2. 使用者在前端按鈕	     |   使用者	       |     資料經由 WebSocket 傳回後台。
-#3. 呼叫 set_result(data)	|  receive_loop  |	self.pending 被填入資料，狀態轉為 Done。
-#4. 恢復執行	            |    事件迴圈	  |   原本卡在 await self.pending 的 Agent 節點被喚醒，拿到 data 並繼續往下走。
-"""
-總結流程
-1. Agent 節點：執行 await manager.wait_for_user() → 「我等你的好消息 (Future) 」。
-2. WebSocket 接收：收到訊息 → 執行 manager.set_result("確認") → 「好消息來了！」。
-3. Future 物件：狀態轉為完成。
-4. Agent 節點：收到 "確認"，繼續執行 if result == "confirm": ...。
-"""
-
-#---------------------以下為邏輯層(共用物件)-------------------------------
 import asyncio, uvicorn
 from fastapi import WebSocket, FastAPI
-from communication import AskMessage, TaskStartMessage, ActionCheck, OperateCommand, TaskEndMessages, ReadUIAndScreenshot, now_timestamp
 from Connection_Manager import manager
-
-
-
 
 #----------------------------以下為通訊層-------------------------------------
 
@@ -35,8 +16,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     #建立連線後先接收第一條訊息
     initial_data: dict = await websocket.receive_json()   
-    print(f"收到前端初始訊息： {initial_data.get('first_messages')}")
-    manager.first_data = initial_data.get("first_messages")
+    print(f"收到前端初始訊息： {initial_data.get('Initial_messages')}")
 
     manager.websocket = websocket
     manager.is_active = True
@@ -47,7 +27,7 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.agent_started = True
         # 啟動 LangGraph Agent
         from LangGraph_Core import run_agent
-        asyncio.create_task(run_agent(manager.first_data, manager))
+        asyncio.create_task(run_agent(manager))
     else:
         print("Agent 已經在運行中，跳過啟動。")
 
@@ -71,5 +51,5 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 if __name__ == '__main__':      #一鍵啟動伺服器
-    uvicorn.run("Server_Core:app", port=8001, reload=True)
+    uvicorn.run("Server_Core:app", port=8002, reload=True)
 #-------------------------------------------------------------------------------

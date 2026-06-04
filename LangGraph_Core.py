@@ -31,7 +31,7 @@ class Action(BaseModel):        #每次根據UI tree生成的操作指令
 
 class State(TypedDict):
     """狀態表，狀態機核心記憶體"""
-    user_command: str                        # 使用者原始指令
+    user_command: str | None                 # 使用者原始指令
     again_check: bool | None                 # 是否再詢問使用者一次的變數
     messages: Annotated[list, add_messages]  # 所有對話紀錄
     define_detail: bool | None               # 判斷是否有明確說明
@@ -82,15 +82,11 @@ class FormatOutput_ask_user(BaseModel):
     )
 class FormatOutput_change_dict(BaseModel):  
     """將使用者補充的具體細節轉換成 dictory"""
-    clarified_params: dict = Field(
+    clarified_params_json: str = Field(
         ...,
-        description="""請將所有需要用到的細節列出來，並用dict的方式
+        description="""請將所有需要用到的細節列出來，並用合法 JSON 字串格式輸出，不要加任何說明
                     例如：
-                    {
-                        "外送平台": "Foodpanda",
-                        "糖分": "半糖",
-                        "冰量": "少冰"。
-                    }
+                    {"外送平台": "Foodpanda", "糖分": "半糖", "冰量": "少冰"}
                     """
     )    
 class FormatOutput_analyze(BaseModel):
@@ -145,7 +141,10 @@ class FormatOutput_error_reason(BaseModel):
 async def check_requirements_completeness(state: State):
     """將使用者指令丟給LLM分析是否缺少具體細節，並將詢問訊息傳給APP"""
 
-    original_command = state["user_command"]
+    user_response: dict = await manager.wait_for_user("first_messages")
+    print(f"**接收到使用者指令：{user_response['first_messages']}")
+    original_command = user_response["first_messages"]
+
     check_llm = llm.with_structured_output(FormatOutput_check_requirements)     #讓LLM依照所定義格式輸出
 
     result = check_llm.invoke([
@@ -161,9 +160,11 @@ async def check_requirements_completeness(state: State):
     ])
     
     if result.again_check:      #判斷是否需要再次詢問使用者，並決定下個節點
-        await manager.send_ask_to_user(result.ask_for_user)    
+        await manager.send_ask_to_user(result.ask_for_user) 
+        print(f"**已傳送詢問訊息給前端：{result.ask_for_user}")   
         #如需要詢問則將 ask_for_user 加進 state，否則不加入
         return {
+            "user_command": user_response["first_messages"],
             "again_check": result.again_check,
             "messages": [
                 {"role": "user", "content": original_command},
@@ -173,6 +174,7 @@ async def check_requirements_completeness(state: State):
     
     else:
         return {
+            "user_command": user_response["first_messages"],
             "again_check": result.again_check,
             "messages": [
                 {"role": "user", "content": original_command},
@@ -184,7 +186,8 @@ async def ask_user_for_details(state: State):
     """呼叫LLM判斷使用者是否有說具體細節，還是說"你決定就好"等等的模糊指令，
     如有說明確細節則將使用者補充的細節轉換成dict格式，放進補全的參數"""
 
-    user_response: dict = await manager.wait_for_user()   #接收使用者回復的訊息
+    user_response: dict = await manager.wait_for_user('detail_response')   #接收使用者回復的訊息
+    print(f"**已接收到具體細節訊息：{user_response['detail_response']}")
 
     ask_llm = llm.with_structured_output(FormatOutput_ask_user)
     result = ask_llm.invoke([       #對是否有明確說明做判斷，只輸出 True 或 False
@@ -201,11 +204,11 @@ async def ask_user_for_details(state: State):
         }
     ])
 
-    detail_result: dict = None
+    detail_result = None
 
     if result.define_detail:    #如有明確說明，則將使用者補充的細節轉換成dict格式，放進clarified_params
         detail_change_dict_llm = llm.with_structured_output(FormatOutput_change_dict)
-        detail_result = detail_change_dict_llm.invoke([
+        detail_result_raw = detail_change_dict_llm.invoke([
             {
                 "role": "system",
                 "content": """請將使用者補充的細節轉換成dict格式。"""
@@ -214,6 +217,7 @@ async def ask_user_for_details(state: State):
                 "role": "user", "content": user_response["detail_response"]
             }
         ])
+        detail_result = json.loads(detail_result_raw.clarified_params_json)
     
     return{"define_detail": result.define_detail,
            "clarified_params": detail_result,
@@ -222,6 +226,7 @@ async def ask_user_for_details(state: State):
 #使用預設值
 async def apply_default_parameters(state: State):
     """使用者若沒說明確細節則進到此節點，請LLM生成預設的值填入補全參數"""
+    print("**進入使用預設值節點")
 
     original_command = state["user_command"]
 
@@ -246,7 +251,7 @@ async def apply_default_parameters(state: State):
         }
     ])
 
-    return{"clarified_params": result.clarified_params}
+    return{"clarified_params": result.clarified_params_json}
 
 #LLM分析指令回傳步驟清單
 async def llm_analyze_command(state: State):
@@ -290,6 +295,7 @@ async def llm_analyze_command(state: State):
                         """
         }
     ])
+    print(f"**步驟清單已生成：{result.total_step}")
 
     return {"total_step": result.total_step}
 
@@ -297,6 +303,7 @@ async def llm_analyze_command(state: State):
 async def notify_task_start(state: State):
     """傳送開始訊息告訴APP端開始執行任務"""
     await manager.send_start_messages()
+    print("**已送出任務開始訊息給前端")
     return{}
 
 #讀取UI Tree
@@ -669,9 +676,9 @@ graph = graph_builder.compile()
 
 #----------------------啟動系統-----------------------------------
 
-async def run_agent(first_messages: str, manager: ConnectionManager):
+async def run_agent(manager: ConnectionManager):
     initial_state = {    #設定初始值
-        "user_command": first_messages,
+        "user_command": None,
         "again_check": None,
         "messages": [],
         "define_detail": None,

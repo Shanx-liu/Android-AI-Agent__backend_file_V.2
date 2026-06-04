@@ -11,32 +11,36 @@ class Action(BaseModel):
 
 class AskMessage(BaseModel):
     """詢問使用者任務具體細節"""
+    type: str
     ask_messages: str
     sent_time: datetime      #傳送json當下的時間
 
 class TaskStartMessage(BaseModel):
     """通知APP端任務開始"""
-    start_message: str
+    type: str
     sent_time: datetime
 
 class ReadUIAndScreenshot(BaseModel):
     """告知APP讀取UI樹與截圖"""
-    read_ui_tree: str
+    type: str
     sent_time: datetime
 
 class ActionCheck(BaseModel):
     """通知使用者敏感操作需確認"""
+    type: str
     action_detail: str
     sensitive_reason: str
     sent_time: datetime
 
 class OperateCommand(BaseModel):
     """發送操作指令給APP"""
+    type: str
     current_action: Action
     sent_time: datetime
 
 class TaskEndMessages(BaseModel):
     """關閉APP進程、告知使用者執行結果"""
+    type: str
     task_result: str
     task_process: str    
     error_reason: str
