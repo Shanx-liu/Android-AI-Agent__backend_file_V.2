@@ -1,6 +1,7 @@
 import asyncio, uvicorn
 from fastapi import WebSocket, FastAPI
 from Connection_Manager import manager
+import colorama
 
 #----------------------------以下為通訊層-------------------------------------
 
@@ -16,7 +17,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     #建立連線後先接收第一條訊息
     initial_data: dict = await websocket.receive_json()   
-    print(f"收到前端初始訊息： {initial_data.get('Initial_messages')}")
+    print(colorama.Fore.RED + f"收到前端初始訊息： {initial_data.get('Initial_messages')}")
 
     manager.websocket = websocket
     manager.is_active = True
@@ -40,11 +41,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 manager.handle_user_response(data)  # 橋接給等待中的節點
                 #將收到的資料藉由 manager 共同物件轉交給 set_sult()方法
         except Exception as e:
-            print(f"連線已中斷: {e}")
+            print(colorama.Fore.RED + f"連線已中斷: {e}")
         finally:
             # 確保最後一定會關閉 WebSocket
             await websocket.close()
-            print("WebSocket 已斷開")
+            print(colorama.Fore.RED + "WebSocket 已斷開")
 
 
     await receive_loop()    #利用上面定義的無窮迴圈，讓WebSocket連線一直保持開啟
