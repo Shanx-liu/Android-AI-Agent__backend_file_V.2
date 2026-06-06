@@ -311,23 +311,25 @@ async def capture_ui_tree(state: State):
     """傳送訊息告訴APP讀取UI tree與截圖，並將收到的截圖與UI Tree放入state"""
 
     await manager.send_read_messages()
+    print("**已送出讀取UI通知")
 
     #收到APP的UI Tree與截圖 -> 將收到的JSON轉為dict  
-    user_response = await manager.wait_for_user()   #等待APP回傳
-    ui_tree: dict = user_response["ui_tree"]
-    base64_str = user_response["screen_shot"]
+    user_response = await manager.wait_for_user('ui_screen_data')   #接收APP回傳
+    print("**接收到 UI Tree 、 截圖")
 
-    b64_clean = base64_str.split(",")[-1]       #去除base64前綴字串
-    image_bytes = base64.b64decode(b64_clean)
+    ui_tree: dict = user_response["ui_tree"]
+    base64_str: str = user_response["screen_shot"]
+    b64_clean = base64_str.split(",")[-1]           #去除base64前綴字串
+    image_bytes = base64.b64decode(b64_clean)       #將base64字串轉成bytes
     
-    return{"current_ui_tree":ui_tree,
+    return{"current_ui_tree": ui_tree,
            "last_screenshot": image_bytes}
 
 #LLM生成操作指令
 async def generate_action_commands(state: State):
     """將當前步驟的步驟名稱、UI Tree、截圖丟給LLM生成操作指令"""
 
-    step_name = state["total_step"][state["current_step"]]["step_name"]
+    step_name: str = state["total_step"][state["current_step"]]["step_name"]
     ui_tree = state["current_ui_tree"]
     screenshot_bytes = state["last_screenshot"]
 
@@ -335,14 +337,15 @@ async def generate_action_commands(state: State):
     b64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
     action_command_llm = llm.with_structured_output(FormatOutput_action_command)
 
-    failure_content = ""
+    failure_content = ""        #若前一步驟執行失敗則載入 失敗原因、下一輪提示
     if state["error_reason"] and state["is_success"] == False:
-        #若前一步驟執行失敗則載入 失敗原因、下一輪提示
         failure_content = f"""
             上一次執行失敗：
             - 失敗原因：{state["error_reason"][-1]}
             - 注意事項：{state["next_round_hint"] or "無"}
             """
+        print("**已載入失敗原因....")
+        
     messages = [
         SystemMessage(content=      #系統訊息
             """   
@@ -350,7 +353,7 @@ async def generate_action_commands(state: State):
 
             你的任務是：
             - 根據目前的步驟名稱、提供的 UI Tree 與截圖
-            - 輸出「唯一一個」操作指令（JSON格式）
+            - 輸出「唯一一個」操作指令(JSON格式)
 
             嚴格遵守格式：
             {
@@ -379,6 +382,7 @@ async def generate_action_commands(state: State):
         ])
     ]
     response = action_command_llm.invoke(messages)
+    print(f"**已生成操作指令：{response.command}")
 
     return{"current_action": response.command}
 
@@ -405,32 +409,44 @@ async def is_sensitive_action(state: State):
                         """
         }
     ])
+    print("**已判斷是否為敏感操作")
+    print(f"**是否為敏感操作：{result.is_sensitive}")
+    print(f"**敏感原因：{result.reason}")
 
     return {"is_sensitive": result.is_sensitive,
-            "sensitive_reason": result.sensitive_reason}
+            "sensitive_reason": result.reason}
 
 #停在該畫面、並通知使用者
 async def notify_user(state: State):
     current_action = state["current_action"]
     sensitive_reason = state["sensitive_reason"]
 
+    messages: str
     # 組成通知訊息
-    messages = f"""偵測到敏感操作，請確認：
-               操作類型：{current_action['action_type']}
-               目標元件：{current_action['target_node_id']}
-               輸入內容：{current_action['input_text']}
-               """
+    if current_action["input_text"] == None:    #不為輸入操作時不帶入 input_text 欄位
+        messages = f"""偵測到敏感操作，請確認：
+                操作類型：{current_action['action_type']}
+                目標元件：{current_action['target_node_id']}
+                """
+    else:
+        messages = f"""偵測到敏感操作，請確認：
+                操作類型：{current_action['action_type']}
+                目標元件：{current_action['target_node_id']}
+                輸入內容：{current_action['input_text']}
+                """
     
     # 傳送通知給APP端（含截圖與訊息）
     await manager.send_action_check(messages, sensitive_reason)
-    return
+    print("**已將敏感操作通知發給前端")
+    return{}
 
-#等待使用者確認/取消)
+#等待使用者確認/取消
 async def wait_for_user_confirm(state: State):
-    user_response = await manager.wait_for_user()   # 等待APP回傳確認或取消
+    user_response = await manager.wait_for_user("sensitive_confirm")   # 等待APP回傳確認或取消
+    print(f"**已收到敏感操作確認：{user_response["request_response"]}")
     
     # 判斷使用者回傳的是確認還是取消
-    is_confirmed = user_response["confirmed"]   # True = 確認, False = 取消
+    is_confirmed = user_response["request_response"]   # True = 確認, False = 取消
     
     return {"is_confirmed": is_confirmed}
 
@@ -438,28 +454,28 @@ async def wait_for_user_confirm(state: State):
 async def send_action_command(state: State):
     """將當前步驟指令傳送給前端APP"""
     #Python 端序列化成 JSON，APP 端解析執行
-    action: Action = state["current_action"]
+    action = state["current_action"]
     await manager.send_command(action)
-    return
+    print("**已發送操作指令給前端")
+
+    return{}
 
 #手機截圖後回傳、並判斷成功與否
 async def screenshot_for_result(state: State):
-    """手機執行操作後截圖回傳，判斷該步驟是否執行成功，成功則進到"判斷任務是否完成"節點，
-    並且步驟數+1，失敗則進到'分析失敗原因、提供解決方法'節點'"""
+    """手機執行操作後截圖回傳，判斷該步驟是否執行成功"""
 
-    system_response: dict = await manager.wait_for_user()
-    base64_str = system_response["operate_screen_shot"]
+    system_response: dict = await manager.wait_for_user("operate_screen_shot")
+    print("**收到操作後之畫面截圖")
 
+    base64_str: str = system_response["operate_screen_shot"]
     b64_clean = base64_str.split(",")[-1]       #去除base64前綴字串
     image_bytes = base64.b64decode(b64_clean)
     b64_image = base64.b64encode(image_bytes).decode("utf-8")   #bytes轉base64
-
 
     current_step_name = state["total_step"][state["current_step"]]["step_name"]
     current_action: Action = state["current_action"]
 
     check_llm = llm.with_structured_output(FormatOutput_chack_action_success)
-
     messages = [
         SystemMessage(content=
             """
@@ -488,8 +504,8 @@ async def screenshot_for_result(state: State):
             }
         ])
     ]
-
     result = check_llm.invoke(messages)
+    print(f"**當前步驟執行結果：{result.is_success}")
 
     return{"is_success": result.is_success,
            "last_screenshot": image_bytes}
@@ -499,7 +515,8 @@ async def analyze_error_solution(state: State):
     """步驟執行失敗後進到此節點，判斷失敗原因並記錄到 state[error_reason]"""
     #將失敗原因帶入下一輪的"生成操作指令"節點，提示LLM上次的操作失敗了，不要用重複的指令
     #寫入 retry hint（給下一輪的提示，不是指令）
-    #供teardown使用
+    #失敗原因供teardown使用
+    print("**進入到錯誤分析節點")
     retry_count = state["retry_count"]
     retry_count += 1  #重試次數+1
     current_step = state["total_step"][state["current_step"]]["step_name"]
@@ -517,7 +534,7 @@ async def analyze_error_solution(state: State):
             剛剛執行一個操作時失敗了
 
             請你根據提供的步驟名稱、執行後的螢幕截圖、操作指令
-            判斷操作失敗原因，並提供一個提示告訴下一輪生成指令時要注意的地方
+            判斷操作的失敗原因，並提供一個提示告訴下一輪生成指令時要注意的地方
             """),
         HumanMessage(content=[
             {
@@ -536,7 +553,8 @@ async def analyze_error_solution(state: State):
         ])
     ]
     result = solution_llm.invoke(messages)
-
+    print(f"**當前步驟失敗原因：{result.error_reason}")
+    
     error_reason = state["error_reason"]
     error_reason.append(result.error_reason)    #將LLM分析的失敗原因新增至 state 的 error_reason
 
@@ -549,12 +567,15 @@ async def task_is_completed(state: State):
     """判斷執行完的步驟是否是最後一個步驟，若為最後一個步驟則進到收尾工作"""
     step_count = state["current_step"]
     step_count += 1
+    print("**步驟數已加 1")
+    print(f"**目前步驟數：{step_count}")
+
     return{"current_step": step_count}
 
 #更新狀態機並執行下個步驟
 async def update_state_and_next_action(state: State):
-    """清空動態臨時欄位(current_ui_tree、last_screenshot、current_action)，
-    回到"讀取UI Tree"節點繼續下一步驟"""
+    """清空動態欄位，繼續下一步驟"""
+    print("**已清空所有動態欄位")
 
     return{"current_ui_tree": None,
            "last_screenshot": None,
@@ -566,28 +587,42 @@ async def update_state_and_next_action(state: State):
 #收尾工作
 async def teardown_process(state: State):
     """在APP顯示執行結果、失敗原因、過程log，通知APP關閉進程"""
+    print("**已進入收尾工作")
     error_messages: list = state["error_reason"].copy()
 
+    #判斷任務結果
     task_result: str
     if state["current_step"] == len(state["total_step"]):
-        task_result = "成功"
-    elif state.get("user_cancel"):      #使用者主動取消任務(待定)
+        task_result = "任務成功"
+    elif not state.get("is_confirmed"):      #使用者主動取消任務(待定)
         task_result = "任務已取消" 
     else:
-        task_result = "失敗"
+        task_result = "任務失敗"
 
+    #過程摘要
     task_process: str = f"""
-        任務總步數：{state['total_step']}
+        任務總步數：{len(state['total_step'])}
         成功執行的步數：{state['current_step']}
-        失敗的步數：{state['retry_count']}
+        失敗的次數：{state['retry_count']}
         """
+
+    #失敗原因
     error_reason: str = ""
     if state["retry_count"] > 0:        #若有失敗過則載入失敗原因
-        for i, message in enumerate(state["error_reason"], start=1):
-            error_messages += f"第{i}次失敗原因：{message}\n"
+        for i, message in enumerate(error_messages, start=1):
+            error_reason += f"第{i}次失敗原因：{message}\n"
 
     manager.send_end_messages(task_result, task_process, error_reason)
-    return{}
+    print("**已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
+
+    return{"current_ui_tree": None,
+           "last_screenshot": None,
+           "current_action": None,
+           "is_sensitive": None,
+           "sensitive_reason": None,
+           "is_confirmed": None,
+           "next_round_hint": None,
+           "task_result": task_result}
 
 
 #-------------------------以下為狀態圖的建構-------------------------
@@ -629,7 +664,6 @@ graph_builder.add_edge("apply_default_parameters", "llm_analyze_command")
 graph_builder.add_edge("llm_analyze_command", "notify_task_start")
 graph_builder.add_edge("notify_task_start", "capture_ui_tree")
 #以下為主流程邊的連接----------------------------------
-#graph_builder.add_edge(START, "capture_ui_tree")
 graph_builder.add_edge("capture_ui_tree", "generate_action_commands")
 graph_builder.add_edge("generate_action_commands", "is_sensitive_action")
 graph_builder.add_conditional_edges(
