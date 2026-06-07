@@ -8,14 +8,14 @@ from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 import os, base64, json
 from Connection_Manager import ConnectionManager, manager
-import colorama
+from colorama import Fore, Style, init
 
-colorama.init(autoreset=True)   #終端機字體顏色設定
+init(autoreset=True)   #終端機字體顏色設定
 load_dotenv()
 
 llm = init_chat_model(      #初始化模型
     "gpt-5.4-mini",
-    google_api_key=os.getenv("OPENAI_API_KEY"),     #設定API_KEY
+    openai_api_key=os.getenv("OPENAI_API_KEY"),     #設定API_KEY
     max_retries=5
 )
 
@@ -144,7 +144,7 @@ async def check_requirements_completeness(state: State):
     """將使用者指令丟給LLM分析是否缺少具體細節，並將詢問訊息傳給APP"""
 
     user_response: dict = await manager.wait_for_user("first_messages")
-    print(colorama.Fore.RED + f"**接收到使用者指令：{user_response['first_messages']}")
+    print(Fore.RED + Style.BRIGHT + f"**接收到使用者指令：{user_response['first_messages']}")
     original_command = user_response["first_messages"]
 
     check_llm = llm.with_structured_output(FormatOutput_check_requirements)     #讓LLM依照所定義格式輸出
@@ -163,7 +163,7 @@ async def check_requirements_completeness(state: State):
     
     if result.again_check:      #判斷是否需要再次詢問使用者，並決定下個節點
         await manager.send_ask_to_user(result.ask_for_user) 
-        print(colorama.Fore.RED + f"**已傳送詢問訊息給前端：{result.ask_for_user}")   
+        print(Fore.RED + Style.BRIGHT + f"**已傳送詢問訊息給前端：{result.ask_for_user}")   
         #如需要詢問則將 ask_for_user 加進 state，否則不加入
         return {
             "user_command": user_response["first_messages"],
@@ -189,7 +189,7 @@ async def ask_user_for_details(state: State):
     如有說明確細節則將使用者補充的細節轉換成dict格式，放進補全的參數"""
 
     user_response: dict = await manager.wait_for_user('detail_response')   #接收使用者回復的訊息
-    print(colorama.Fore.RED + f"**已接收到具體細節訊息：{user_response['detail_response']}")
+    print(Fore.RED + Style.BRIGHT + f"**已接收到具體細節訊息：{user_response['detail_response']}")
 
     ask_llm = llm.with_structured_output(FormatOutput_ask_user)
     result = ask_llm.invoke([       #對是否有明確說明做判斷，只輸出 True 或 False
@@ -228,7 +228,7 @@ async def ask_user_for_details(state: State):
 #使用預設值
 async def apply_default_parameters(state: State):
     """使用者若沒說明確細節則進到此節點，請LLM生成預設的值填入補全參數"""
-    print(colorama.Fore.RED + "**進入使用預設值節點")
+    print(Fore.RED + Style.BRIGHT + "**進入使用預設值節點")
 
     original_command = state["user_command"]
 
@@ -297,7 +297,7 @@ async def llm_analyze_command(state: State):
                         """
         }
     ])
-    print(colorama.Fore.RED + f"**步驟清單已生成：{result.total_step}")
+    print(Fore.RED + Style.BRIGHT + f"**步驟清單已生成：{result.total_step}")
 
     return {"total_step": result.total_step}
 
@@ -305,7 +305,7 @@ async def llm_analyze_command(state: State):
 async def notify_task_start(state: State):
     """傳送開始訊息告訴APP端開始執行任務"""
     await manager.send_start_messages()
-    print(colorama.Fore.RED + "**已送出任務開始訊息給前端")
+    print(Fore.RED + Style.BRIGHT + "**已送出任務開始訊息給前端")
     return{}
 
 #讀取UI Tree
@@ -313,11 +313,11 @@ async def capture_ui_tree(state: State):
     """傳送訊息告訴APP讀取UI tree與截圖，並將收到的截圖與UI Tree放入state"""
 
     await manager.send_read_messages()
-    print(colorama.Fore.RED + "**已送出讀取UI通知")
+    print(Fore.RED + Style.BRIGHT + "**已送出讀取UI通知")
 
     #收到APP的UI Tree與截圖 -> 將收到的JSON轉為dict  
-    user_response = await manager.wait_for_user('ui_screen_data')   #接收APP回傳
-    print(colorama.Fore.RED + "**接收到 UI Tree 、 截圖")
+    user_response = await manager.wait_for_user("ui_screen_data")   #接收APP回傳
+    print(Fore.RED + Style.BRIGHT + "**接收到 UI Tree 、 截圖")
 
     ui_tree: dict = user_response["ui_tree"]
     base64_str: str = user_response["screen_shot"]
@@ -346,7 +346,7 @@ async def generate_action_commands(state: State):
             - 失敗原因：{state["error_reason"][-1]}
             - 注意事項：{state["next_round_hint"] or "無"}
             """
-        print(colorama.Fore.RED + "**已載入失敗原因....")
+        print(Fore.RED + Style.BRIGHT + "**已載入失敗原因....")
         
     messages = [
         SystemMessage(content=      #系統訊息
@@ -384,7 +384,7 @@ async def generate_action_commands(state: State):
         ])
     ]
     response = action_command_llm.invoke(messages)
-    print(colorama.Fore.RED + f"**已生成操作指令：{response.command}")
+    print(Fore.RED + Style.BRIGHT + f"**已生成操作指令：{response.command}")
 
     return{"current_action": response.command}
 
@@ -411,9 +411,9 @@ async def is_sensitive_action(state: State):
                         """
         }
     ])
-    print(colorama.Fore.RED + "**已判斷是否為敏感操作")
-    print(colorama.Fore.RED + f"**是否為敏感操作：{result.is_sensitive}")
-    print(colorama.Fore.RED + f"**敏感原因：{result.reason}")
+    print(Fore.RED + Style.BRIGHT + "**已判斷是否為敏感操作")
+    print(Fore.RED + Style.BRIGHT + f"**是否為敏感操作：{result.is_sensitive}")
+    print(Fore.RED + Style.BRIGHT + f"**敏感原因：{result.reason}")
 
     return {"is_sensitive": result.is_sensitive,
             "sensitive_reason": result.reason}
@@ -439,13 +439,13 @@ async def notify_user(state: State):
     
     # 傳送通知給APP端（含截圖與訊息）
     await manager.send_action_check(messages, sensitive_reason)
-    print(colorama.Fore.RED + "**已將敏感操作通知發給前端")
+    print(Fore.RED + Style.BRIGHT + "**已將敏感操作通知發給前端")
     return{}
 
 #等待使用者確認/取消
 async def wait_for_user_confirm(state: State):
     user_response = await manager.wait_for_user("sensitive_confirm")   # 等待APP回傳確認或取消
-    print(colorama.Fore.RED + f"**已收到敏感操作確認：{user_response["request_response"]}")
+    print(Fore.RED + Style.BRIGHT + f"**已收到敏感操作確認：{user_response['request_response']}")
     
     # 判斷使用者回傳的是確認還是取消
     is_confirmed = user_response["request_response"]   # True = 確認, False = 取消
@@ -458,7 +458,7 @@ async def send_action_command(state: State):
     #Python 端序列化成 JSON，APP 端解析執行
     action = state["current_action"]
     await manager.send_command(action)
-    print(colorama.Fore.RED + "**已發送操作指令給前端")
+    print(Fore.RED + Style.BRIGHT + "**已發送操作指令給前端")
 
     return{}
 
@@ -467,7 +467,7 @@ async def screenshot_for_result(state: State):
     """手機執行操作後截圖回傳，判斷該步驟是否執行成功"""
 
     system_response: dict = await manager.wait_for_user("operate_screen_shot")
-    print(colorama.Fore.RED + "**收到操作後之畫面截圖")
+    print(Fore.RED + Style.BRIGHT + "**收到操作後之畫面截圖")
 
     base64_str: str = system_response["operate_screen_shot"]
     b64_clean = base64_str.split(",")[-1]       #去除base64前綴字串
@@ -507,7 +507,7 @@ async def screenshot_for_result(state: State):
         ])
     ]
     result = check_llm.invoke(messages)
-    print(colorama.Fore.RED + f"**當前步驟執行結果：{result.is_success}")
+    print(Fore.RED + Style.BRIGHT + f"**當前步驟執行結果：{result.is_success}")
 
     return{"is_success": result.is_success,
            "last_screenshot": image_bytes}
@@ -518,7 +518,7 @@ async def analyze_error_solution(state: State):
     #將失敗原因帶入下一輪的"生成操作指令"節點，提示LLM上次的操作失敗了，不要用重複的指令
     #寫入 retry hint（給下一輪的提示，不是指令）
     #失敗原因供teardown使用
-    print(colorama.Fore.RED + "**進入到錯誤分析節點")
+    print(Fore.RED + Style.BRIGHT + "**進入到錯誤分析節點")
     retry_count = state["retry_count"]
     retry_count += 1  #重試次數+1
     current_step = state["total_step"][state["current_step"]]["step_name"]
@@ -555,7 +555,7 @@ async def analyze_error_solution(state: State):
         ])
     ]
     result = solution_llm.invoke(messages)
-    print(colorama.Fore.RED + f"**當前步驟失敗原因：{result.error_reason}")
+    print(Fore.RED + Style.BRIGHT + f"**當前步驟失敗原因：{result.error_reason}")
     
     error_reason = state["error_reason"]
     error_reason.append(result.error_reason)    #將LLM分析的失敗原因新增至 state 的 error_reason
@@ -569,15 +569,15 @@ async def task_is_completed(state: State):
     """判斷執行完的步驟是否是最後一個步驟，若為最後一個步驟則進到收尾工作"""
     step_count = state["current_step"]
     step_count += 1
-    print(colorama.Fore.RED + "**步驟數已加 1")
-    print(colorama.Fore.RED + f"**目前步驟數：{step_count}")
+    print(Fore.RED + Style.BRIGHT + "**步驟數已加 1")
+    print(Fore.RED + Style.BRIGHT + f"**目前步驟數：{step_count}")
 
     return{"current_step": step_count}
 
 #更新狀態機並執行下個步驟
 async def update_state_and_next_action(state: State):
     """清空動態欄位，繼續下一步驟"""
-    print(colorama.Fore.RED + "**已清空所有動態欄位")
+    print(Fore.RED + Style.BRIGHT + "**已清空所有動態欄位")
 
     return{"current_ui_tree": None,
            "last_screenshot": None,
@@ -589,7 +589,7 @@ async def update_state_and_next_action(state: State):
 #收尾工作
 async def teardown_process(state: State):
     """在APP顯示執行結果、失敗原因、過程log，通知APP關閉進程"""
-    print(colorama.Fore.RED + "**已進入收尾工作")
+    print(Fore.RED + Style.BRIGHT + "**已進入收尾工作")
     error_messages: list = state["error_reason"].copy()
 
     #判斷任務結果
@@ -615,7 +615,7 @@ async def teardown_process(state: State):
             error_reason += f"第{i}次失敗原因：{message}\n"
 
     manager.send_end_messages(task_result, task_process, error_reason)
-    print(colorama.Fore.RED + "**已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
+    print(Fore.RED + Style.BRIGHT + "**已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
 
     return{"current_ui_tree": None,
            "last_screenshot": None,
@@ -713,7 +713,7 @@ graph = graph_builder.compile()
 #----------------------啟動系統-----------------------------------
 
 async def run_agent(manager: ConnectionManager):
-    print(colorama.Fore.RED + "**  Agent代理 已啟動  **")
+    print(Fore.RED + Style.BRIGHT + "**  Agent代理 已啟動  **")
     initial_state = {    #設定初始值
         "user_command": None,
         "again_check": None,
@@ -735,7 +735,7 @@ async def run_agent(manager: ConnectionManager):
         "next_round_hint": None
     }
 
-    state = graph.ainvoke(initial_state)     #初始化狀態表
+    state = await graph.ainvoke(initial_state)     #初始化狀態表
 
 
 #----------------------以下為圖的繪製---------------------------

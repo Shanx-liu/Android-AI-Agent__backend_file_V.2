@@ -3,7 +3,7 @@ from fastapi import WebSocket, FastAPI
 from communication import AskMessage, TaskStartMessage, ActionCheck, OperateCommand, TaskEndMessages, ReadUIAndScreenshot, now_timestamp
 from pydantic import BaseModel
 from communication import Action
-
+import colorama
 
 class ConnectionManager:     #全域的狀態共享中心，為"邏輯層"與"通訊層"的 通訊橋樑（Intermediary）
     def __init__(self):
@@ -102,6 +102,7 @@ class ConnectionManager:     #全域的狀態共享中心，為"邏輯層"與"�
         while True:
             data: dict = await self._message_queue.get()
             if data.get("type") == expected_type:       #取出符合 type 值的訊息
+                print(colorama.Fore.BLUE + f"{data}")
                 return data
             else:
                 # 不是要的類型，放回去等下一個節點消費

@@ -6,7 +6,7 @@ import colorama
 #----------------------------以下為通訊層-------------------------------------
 
 #用WebSocket時，網址開頭要是 ws:// 或 wss://
-#ngrok發布命令：/ngrok/ngrok.exe http --url=unannealed-controllingly-sarai.ngrok-free.dev 8001
+#ngrok發布命令：/ngrok/ngrok.exe http --url=unannealed-controllingly-sarai.ngrok-free.dev 8002
 #WebSocket 根 URL：wss://unannealed-controllingly-sarai.ngrok-free.dev/ws
 
 app = FastAPI()
@@ -17,7 +17,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     #建立連線後先接收第一條訊息
     initial_data: dict = await websocket.receive_json()   
-    print(colorama.Fore.RED + f"收到前端初始訊息： {initial_data.get('Initial_messages')}")
+    print(colorama.Fore.RED + colorama.Style.BRIGHT + f"收到前端初始訊息： {initial_data.get('Initial_messages')}")
 
     manager.websocket = websocket
     manager.is_active = True
