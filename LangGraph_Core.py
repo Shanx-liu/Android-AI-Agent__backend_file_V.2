@@ -23,12 +23,17 @@ class Step(TypedDict):      #LLM生成步驟清單的規範
     step_name: str  
     #操作指令不先寫死，而是根據該步驟的名稱、擷取到的UI tree來生成
 
+class BoundsXY(BaseModel):
+    x: int      # 元件中心點 X（node.x + node.width // 2）
+    y: int      # 元件中心點 Y（node.y + node.height // 2）     
 
-class Action(BaseModel):        #每次根據UI tree生成的操作指令
+class Action(BaseModel):            #每次根據UI tree生成的操作指令
     """操作指令細節"""
-    action_type: str            # "click" / "set_text" / "scroll" / "global_back"
-    target_node_id: str         # 來自 UI Tree 的 node resource-id 或 bounds
-    input_text: str | None      # 僅 set_text 時使用
+    action_type: str                # "click" / "set_text" / "scroll" / "global_back"
+    resource_id: str | None         # 優先使用，來自 UiNode.resourceId
+    bounds_x: BoundsXY | None       # resource_id 不存在時的 fallback
+    input_text: str | None          # 僅 set_text 時使用
+    scroll_direction: str | None    # 僅 scroll 時使用："up"/"down"/"left"/"right"
 
 
 class State(TypedDict):
@@ -104,8 +109,15 @@ class FormatOutput_action_command(BaseModel):
     """請LLM生成對應的操作指令"""
     command: Action = Field(
         ...,
-        description="""Action類別裡包含action_type、
-                    target_node_id、input_text，請生成對應的值"""
+        description="""Action類別裡包含
+                    {
+                        action_type
+                        resource_id
+                        bounds
+                        input_text
+                        scroll_direction
+                    }
+                    請生成對應的值"""
     )
 class FormatOutput_sensitive_check(BaseModel):
     """判斷是否為敏感操作"""
@@ -274,6 +286,8 @@ async def llm_analyze_command(state: State):
 
                         生成完整且具體的操作流程。
 
+                        **每個步驟必須精細到能用單一指令操作的程度**
+                        
                         輸出格式必須為：
                         [
                             {"step_name": "步驟1"},
@@ -316,7 +330,7 @@ async def capture_ui_tree(state: State):
     print(Fore.RED + Style.BRIGHT + "**已送出讀取UI通知")
 
     #收到APP的UI Tree與截圖 -> 將收到的JSON轉為dict  
-    user_response = await manager.wait_for_user("ui_screen_data")   #接收APP回傳
+    user_response: dict = await manager.wait_for_user('ui_screen_data')   #接收APP回傳
     print(Fore.RED + Style.BRIGHT + "**接收到 UI Tree 、 截圖")
 
     ui_tree: dict = user_response["ui_tree"]
@@ -357,11 +371,18 @@ async def generate_action_commands(state: State):
             - 根據目前的步驟名稱、提供的 UI Tree 與截圖
             - 輸出「唯一一個」操作指令(JSON格式)
 
+            目標節點識別規則：
+            1. 優先填 resource_id
+            2. 若節點無 resource_id，才填 bounds
+            3. 兩者不可同時為 null
+
             嚴格遵守格式：
             {
                 "action_type": "click" | "set_text" | "scroll" | "global_back",
-                "target_node_id": "<resource-id 或 bounds>",
-                "input_text": "<僅 set_text 時填入，其餘為 null>"
+                "resource_id": "Node 的 resourceID",
+                "bounds: BoundsXY": "resource_ID不存在時填入",
+                "input_text": "<僅 set_text 時填入，其餘為 null>",
+                "scroll_direction": "僅 scroll 時使用: "up"/"down"/"left"/"right"
             }
             禁止輸出任何額外說明。          
             """),
