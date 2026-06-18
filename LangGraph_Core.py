@@ -9,6 +9,7 @@ from typing_extensions import TypedDict
 import os, base64, json
 from Connection_Manager import ConnectionManager, manager
 from colorama import Fore, Style, init
+import time
 
 init(autoreset=True)   #終端機字體顏色設定
 load_dotenv()
@@ -31,6 +32,7 @@ class Action(BaseModel):            #每次根據UI tree生成的操作指令
     """操作指令細節"""
     action_type: str                # "click" / "set_text" / "scroll" / "global_back"
     resource_id: str | None         # 優先使用，來自 UiNode.resourceId
+    content_description: str | None # 次選：桌面圖示、無障礙標籤場景
     bounds_x: BoundsXY | None       # resource_id 不存在時的 fallback
     input_text: str | None          # 僅 set_text 時使用
     scroll_direction: str | None    # 僅 scroll 時使用："up"/"down"/"left"/"right"
@@ -43,6 +45,7 @@ class State(TypedDict):
     messages: Annotated[list, add_messages]  # 所有對話紀錄
     define_detail: bool | None               # 判斷是否有明確說明
     clarified_params: dict | None            # 補全的參數（詢問使用者或使用預設值後填入）
+    user_confirm_start: bool | None          # 使用者確認 開始/取消 任務
     #上面的變數為前置處理所需
     total_step: list[Step] | None            # LLM分析的步驟清單    
     current_step: int                        # 目前執行到第幾步
@@ -320,12 +323,17 @@ async def notify_task_start(state: State):
     """傳送開始訊息告訴APP端開始執行任務"""
     await manager.send_start_messages()
     print(Fore.RED + Style.BRIGHT + "**已送出任務開始訊息給前端")
-    return{}
+
+    user_response: dict = await manager.wait_for_user('user_confirm_start')
+    print(Fore.RED + Style.BRIGHT + f"**接收到使用者確認/取消：{user_response['user_confirm']}")
+
+    return{"user_confirm_start": user_response["user_confirm"]}
 
 #讀取UI Tree
 async def capture_ui_tree(state: State):
     """傳送訊息告訴APP讀取UI tree與截圖，並將收到的截圖與UI Tree放入state"""
 
+    time.sleep(4)
     await manager.send_read_messages()
     print(Fore.RED + Style.BRIGHT + "**已送出讀取UI通知")
 
@@ -334,12 +342,12 @@ async def capture_ui_tree(state: State):
     print(Fore.RED + Style.BRIGHT + "**接收到 UI Tree 、 截圖")
 
     ui_tree: dict = user_response["ui_tree"]
-    base64_str: str = user_response["screen_shot"]
-    b64_clean = base64_str.split(",")[-1]           #去除base64前綴字串
-    image_bytes = base64.b64decode(b64_clean)       #將base64字串轉成bytes
+    #base64_str: str = user_response["screen_shot"]
+    #b64_clean = base64_str.split(",")[-1]           #去除base64前綴字串
+    #image_bytes = base64.b64decode(b64_clean)       #將base64字串轉成bytes
     
-    return{"current_ui_tree": ui_tree,
-           "last_screenshot": image_bytes}
+    return{"current_ui_tree": ui_tree}
+           #"last_screenshot": image_bytes
 
 #LLM生成操作指令
 async def generate_action_commands(state: State):
@@ -347,10 +355,10 @@ async def generate_action_commands(state: State):
 
     step_name: str = state["total_step"][state["current_step"]]["step_name"]
     ui_tree = state["current_ui_tree"]
-    screenshot_bytes = state["last_screenshot"]
+    #screenshot_bytes = state["last_screenshot"]
 
     #bytes轉base64
-    b64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
+    #b64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
     action_command_llm = llm.with_structured_output(FormatOutput_action_command)
 
     failure_content = ""        #若前一步驟執行失敗則載入 失敗原因、下一輪提示
@@ -368,18 +376,19 @@ async def generate_action_commands(state: State):
             你是一個 Android UI 操作代理。
 
             你的任務是：
-            - 根據目前的步驟名稱、提供的 UI Tree 與截圖
+            - 根據目前的步驟名稱、提供的 UI Tree
             - 輸出「唯一一個」操作指令(JSON格式)
 
-            目標節點識別規則：
-            1. 優先填 resource_id
-            2. 若節點無 resource_id，才填 bounds
-            3. 兩者不可同時為 null
+            目標節點識別規則（依序判斷）：
+            1. resource_id 有值且在當前畫面唯一 → 填 resource_id
+            2. resource_id 為通用值（如 "icon"）或重複 → 改填 content_description
+            3. 兩者皆無或不可靠 → 填 bounds 座標
 
             嚴格遵守格式：
             {
                 "action_type": "click" | "set_text" | "scroll" | "global_back",
                 "resource_id": "Node 的 resourceID",
+                "content_description": "如有多個resourceID重複時填入",
                 "bounds: BoundsXY": "resource_ID不存在時填入",
                 "input_text": "<僅 set_text 時填入，其餘為 null>",
                 "scroll_direction": "僅 scroll 時使用: "up"/"down"/"left"/"right"
@@ -387,12 +396,12 @@ async def generate_action_commands(state: State):
             禁止輸出任何額外說明。          
             """),
         HumanMessage(content=[      #人類訊息(放步驟名稱、截圖、UI Tree)
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{b64_image}"
-                    }
-            },
+            #{
+            #    "type": "image_url",
+            #    "image_url": {
+            #        "url": f"data:image/jpeg;base64,{b64_image}"
+            #        }
+            #},
             {
                 "type": "text",
                 "text": f"""
@@ -427,7 +436,8 @@ async def is_sensitive_action(state: State):
             "content": f"""
                         操作指令：
                         action_type: {current_action['action_type']}
-                        target_node_id: {current_action['target_node_id']}
+                        resource_id: {current_action['resource_id']}
+                        content_description: {current_action['content_description']}
                         input_text: {current_action['input_text']}
                         """
         }
@@ -449,12 +459,12 @@ async def notify_user(state: State):
     if current_action["input_text"] == None:    #不為輸入操作時不帶入 input_text 欄位
         messages = f"""偵測到敏感操作，請確認：
                 操作類型：{current_action['action_type']}
-                目標元件：{current_action['target_node_id']}
+                目標元件：{current_action['resource_id']}
                 """
     else:
         messages = f"""偵測到敏感操作，請確認：
                 操作類型：{current_action['action_type']}
-                目標元件：{current_action['target_node_id']}
+                目標元件：{current_action['resource_id']}
                 輸入內容：{current_action['input_text']}
                 """
     
@@ -671,7 +681,7 @@ graph_builder.add_node("update_state_and_next_action", update_state_and_next_act
 graph_builder.add_node("teardown_process", teardown_process)
 
 
-#以下為邊的連接---------------
+#以下為任務初始化邊的連接---------------
 graph_builder.add_edge(START, "check_requirements_completeness")
 graph_builder.add_conditional_edges(
     "check_requirements_completeness",      #從缺少具體細節發出條件邊
@@ -685,7 +695,11 @@ graph_builder.add_conditional_edges(
 )
 graph_builder.add_edge("apply_default_parameters", "llm_analyze_command")
 graph_builder.add_edge("llm_analyze_command", "notify_task_start")
-graph_builder.add_edge("notify_task_start", "capture_ui_tree")
+graph_builder.add_conditional_edges(
+    "notify_task_start",
+    lambda state: state.get("user_confirm_start"),
+    {True: "capture_ui_tree", False: "teardown_process"}
+)
 #以下為主流程邊的連接----------------------------------
 graph_builder.add_edge("capture_ui_tree", "generate_action_commands")
 graph_builder.add_edge("generate_action_commands", "is_sensitive_action")
@@ -741,6 +755,7 @@ async def run_agent(manager: ConnectionManager):
         "messages": [],
         "define_detail": None,
         "clarified_params": None,
+        "user_confirm_start": None,
         "total_step": None,
         "current_step": 0,
         "current_ui_tree": None,
