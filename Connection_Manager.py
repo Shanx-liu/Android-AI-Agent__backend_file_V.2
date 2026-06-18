@@ -1,6 +1,6 @@
 import asyncio
 from fastapi import WebSocket, FastAPI
-from communication import AskMessage, TaskStartMessage, ActionCheck, OperateCommand, TaskEndMessages, ReadUIAndScreenshot, now_timestamp
+from communication import AskMessage, TaskStartMessage, ActionCheck, OperateCommand, TaskEndMessages, ReadUIAndScreenshot, UserCancelMessages, now_timestamp
 from pydantic import BaseModel
 from communication import Action
 import colorama
@@ -91,6 +91,20 @@ class ConnectionManager:     #全域的狀態共享中心，為"邏輯層"與"�
             task_result = task_result,
             task_process = task_process,
             error_reason = error_reason,
+            sent_time = now_timestamp()
+        )
+        await self.websocket.send_json(
+            json_data.model_dump(mode='json')
+        )
+
+    async def send_user_cancel_messages(self, cancel_message: str):
+        """如使用者取消只需傳送一段字串告訴使用者任務已被取消"""
+        if self.websocket is None:
+            raise RuntimeError("WebSocket 尚未連線")
+
+        json_data = UserCancelMessages(
+            type = "task_cancel",
+            cancel_message = cancel_message,
             sent_time = now_timestamp()
         )
         await self.websocket.send_json(

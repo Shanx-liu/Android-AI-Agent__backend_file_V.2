@@ -116,6 +116,7 @@ class FormatOutput_action_command(BaseModel):
                     {
                         action_type
                         resource_id
+                        content_description
                         bounds
                         input_text
                         scroll_direction
@@ -621,6 +622,11 @@ async def update_state_and_next_action(state: State):
 async def teardown_process(state: State):
     """在APP顯示執行結果、失敗原因、過程log，通知APP關閉進程"""
     print(Fore.RED + Style.BRIGHT + "**已進入收尾工作")
+    
+    if state["user_confirm_start"] == False:    #當使用者自行取消時觸發這段
+        print(Fore.RED + Style.BRIGHT + "**使用者自行取消任務**")
+        await manager.send_user_cancel_messages("您已取消任務！")
+
     error_messages: list = state["error_reason"].copy()
 
     #判斷任務結果
@@ -645,7 +651,7 @@ async def teardown_process(state: State):
         for i, message in enumerate(error_messages, start=1):
             error_reason += f"第{i}次失敗原因：{message}\n"
 
-    manager.send_end_messages(task_result, task_process, error_reason)
+    await manager.send_end_messages(task_result, task_process, error_reason)
     print(Fore.RED + Style.BRIGHT + "**已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
 
     return{"current_ui_tree": None,

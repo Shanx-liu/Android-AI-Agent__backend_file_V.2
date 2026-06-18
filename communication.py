@@ -54,6 +54,12 @@ class TaskEndMessages(BaseModel):
     error_reason: str
     sent_time: str
 
+class UserCancelMessages(BaseModel):
+    """使用者取消時用"""
+    type: str
+    cancel_message: str
+    sent_time: str
+
 def now_timestamp() -> str:
     """回傳當下時間的函式，回傳型別為 str"""
     tz = zoneinfo.ZoneInfo("Asia/Taipei")
