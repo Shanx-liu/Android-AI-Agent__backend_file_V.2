@@ -2,6 +2,7 @@
 from pydantic import BaseModel
 from datetime import datetime, timezone
 import zoneinfo
+from Action import Action
 
 #以下為傳給前端之 JSON 定義
 
