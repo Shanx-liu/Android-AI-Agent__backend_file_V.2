@@ -2,7 +2,7 @@ import asyncio
 from fastapi import WebSocket, FastAPI
 from communication import AskMessage, TaskStartMessage, ActionCheck, OperateCommand, TaskEndMessages, ReadUIAndScreenshot, UserCancelMessages, now_timestamp
 from pydantic import BaseModel
-from communication import Action
+from Action import Action
 import colorama
 
 class ConnectionManager:     #全域的狀態共享中心，為"邏輯層"與"通訊層"的 通訊橋樑（Intermediary）
