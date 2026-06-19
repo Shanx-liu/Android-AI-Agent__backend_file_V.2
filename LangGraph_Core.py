@@ -424,16 +424,16 @@ async def is_sensitive_action(state: State):
             "role": "user",
             "content": f"""
                         操作指令：
-                        action_type: {current_action['action_type']}
-                        resource_id: {current_action['resource_id']}
-                        content_description: {current_action['content_description']}
-                        input_text: {current_action['input_text']}
+                        action_type: {current_action.action_type}
+                        resource_id: {current_action.resource_id}
+                        content_description: {current_action.content_description}
+                        input_text: {current_action.input_text}
                         """
         }
     ])
     print(Fore.RED + Style.BRIGHT + "**已判斷是否為敏感操作")
-    print(Fore.RED + Style.BRIGHT + f"**是否為敏感操作：{result.is_sensitive}")
-    print(Fore.RED + Style.BRIGHT + f"**敏感原因：{result.reason}")
+    print(Fore.YELLOW + Style.BRIGHT + f"**是否為敏感操作：{result.is_sensitive}")
+    print(Fore.YELLOW + Style.BRIGHT + f"**原因：{result.reason}")
 
     return {"is_sensitive": result.is_sensitive,
             "sensitive_reason": result.reason}
@@ -445,16 +445,16 @@ async def notify_user(state: State):
 
     messages: str
     # 組成通知訊息
-    if current_action["input_text"] == None:    #不為輸入操作時不帶入 input_text 欄位
+    if current_action.input_text == None:    #不為輸入操作時不帶入 input_text 欄位
         messages = f"""偵測到敏感操作，請確認：
-                操作類型：{current_action['action_type']}
-                目標元件：{current_action['resource_id']}
+                操作類型：{current_action.action_type}
+                目標元件：{current_action.resource_id}
                 """
     else:
         messages = f"""偵測到敏感操作，請確認：
-                操作類型：{current_action['action_type']}
-                目標元件：{current_action['resource_id']}
-                輸入內容：{current_action['input_text']}
+                操作類型：{current_action.action_type}
+                目標元件：{current_action.resource_id}
+                輸入內容：{current_action.input_text}
                 """
     
     # 傳送通知給APP端（含截圖與訊息）
