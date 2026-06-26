@@ -39,7 +39,7 @@ class State(TypedDict):
     current_step: int                        # 目前執行到第幾步
     current_ui_tree: dict | None             # 每步執行前讀入，步驟結束後可清除
     current_action: Action | None            # LLM 根據 UI Tree 生成，執行完後清除
-    last_screenshot: bytes | None            # 最後一張螢幕截圖
+    last_ui_tree: dict | None                # 最後一張螢幕截圖
     retry_count: int                         # 失敗重試次數
     is_success: bool | None                  # 當前步驟是否執行成功；成功為 True，失敗為 False 
     is_sensitive: bool | None                # 是否為敏感操作，是敏感操作時為True，否則為False
@@ -344,10 +344,7 @@ async def generate_action_commands(state: State):
 
     step_name: str = state["total_step"][state["current_step"]]["step_name"]
     ui_tree = state["current_ui_tree"]
-    #screenshot_bytes = state["last_screenshot"]
-
-    #bytes轉base64
-    #b64_image = base64.b64encode(screenshot_bytes).decode("utf-8")
+    
     action_command_llm = llm.with_structured_output(FormatOutput_action_command)
 
     failure_content = ""        #若前一步驟執行失敗則載入 失敗原因、下一輪提示
@@ -368,6 +365,11 @@ async def generate_action_commands(state: State):
             - 根據目前的步驟名稱、提供的 UI Tree
             - 輸出「唯一一個」操作指令(JSON格式)
 
+            **若當前畫面的UI Tree不能執行當前步驟的操作指令**
+            - 例如：須關閉廣告視窗、有其他阻擋畫面的彈窗
+            - 則以關閉這些彈窗生成操作指令
+            - 並且不將這次操作算進步驟數
+
             目標節點識別規則（依序判斷）：
             1. resource_id 有值且在當前畫面唯一 → 填 resource_id
             2. resource_id 為通用值（如 "icon"）或重複 → 改填 content_description
@@ -384,13 +386,7 @@ async def generate_action_commands(state: State):
             }
             禁止輸出任何額外說明。          
             """),
-        HumanMessage(content=[      #人類訊息(放步驟名稱、截圖、UI Tree)
-            #{
-            #    "type": "image_url",
-            #    "image_url": {
-            #        "url": f"data:image/jpeg;base64,{b64_image}"
-            #        }
-            #},
+        HumanMessage(content=[      #人類訊息(放步驟名稱、UI Tree)
             {
                 "type": "text",
                 "text": f"""
@@ -475,7 +471,6 @@ async def wait_for_user_confirm(state: State):
 #發送操作指令
 async def send_action_command(state: State):
     """將當前步驟指令傳送給前端APP"""
-    #Python 端序列化成 JSON，APP 端解析執行
     action = state["current_action"]
     await manager.send_command(action)
     print(Fore.RED + Style.BRIGHT + "**已發送操作指令給前端")
@@ -485,15 +480,12 @@ async def send_action_command(state: State):
 #手機截圖後回傳、並判斷成功與否
 async def screenshot_for_result(state: State):
     """手機執行操作後截圖回傳，判斷該步驟是否執行成功"""
+    print(Fore.RED + Style.BRIGHT + f"進入接收 UI Tree判斷是否成功節點")
 
-    system_response: dict = await manager.wait_for_user("operate_screen_shot")
-    print(Fore.RED + Style.BRIGHT + "**收到操作後之畫面截圖")
+    system_response: dict = await manager.wait_for_user("ui_screen_data")
+    print(Fore.RED + Style.BRIGHT + "**收到操作後之 UI Tree")
 
-    base64_str: str = system_response["operate_screen_shot"]
-    b64_clean = base64_str.split(",")[-1]       #去除base64前綴字串
-    image_bytes = base64.b64decode(b64_clean)
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")   #bytes轉base64
-
+    ui_tree: str = system_response["ui_tree"]
     current_step_name = state["total_step"][state["current_step"]]["step_name"]
     current_action: Action = state["current_action"]
 
@@ -504,7 +496,7 @@ async def screenshot_for_result(state: State):
             你是一個 Android UI 操作代理。
 
             你剛執行完一個步驟
-            - 請根據目前的螢幕截圖、執行時的步驟名稱、操作指令
+            - 請根據目前的UI Tree、執行時的步驟名稱、操作指令
             - 判斷剛才的步驟是否執行成功
 
             成功則輸出: True
@@ -512,16 +504,11 @@ async def screenshot_for_result(state: State):
             """),
         HumanMessage(content=[
             {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{b64_image}"
-                }
-            },
-            {
                 "type": "text",
                 "text": f"""
                         剛剛執行的步驟名稱：{current_step_name}
                         執行的操作指令：{current_action}
+                        執行後的 UI Tree：{ui_tree}
                         """
             }
         ])
@@ -530,7 +517,8 @@ async def screenshot_for_result(state: State):
     print(Fore.RED + Style.BRIGHT + f"**當前步驟執行結果：{result.is_success}")
 
     return{"is_success": result.is_success,
-           "last_screenshot": image_bytes}
+           "ui_tree": ui_tree}
+           #"last_screenshot": image_bytes
     
 #分析失敗原因、提供解決方法
 async def analyze_error_solution(state: State):
@@ -543,9 +531,7 @@ async def analyze_error_solution(state: State):
     retry_count += 1  #重試次數+1
     current_step = state["total_step"][state["current_step"]]["step_name"]
     current_action = state["current_action"]
-
-    screen_shot = state["last_screenshot"]      #螢幕截圖
-    b64_image = base64.b64encode(screen_shot).decode("utf-8")
+    last_ui_tree = state["last_ui_tree"]
 
     solution_llm = llm.with_structured_output(FormatOutput_error_reason)
     messages = [
@@ -555,21 +541,16 @@ async def analyze_error_solution(state: State):
 
             剛剛執行一個操作時失敗了
 
-            請你根據提供的步驟名稱、執行後的螢幕截圖、操作指令
+            請你根據提供的步驟名稱、執行後的UI Tree、操作指令
             判斷操作的失敗原因，並提供一個提示告訴下一輪生成指令時要注意的地方
             """),
         HumanMessage(content=[
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{b64_image}"
-                }
-            },
             {
                 "type": "text",
                 "text": f"""
                         步驟名稱：{current_step}
                         執行的操作指令：{current_action}
+                        執行後的 UI Tree：{last_ui_tree}
                         """
             }
         ])
@@ -643,7 +624,7 @@ async def teardown_process(state: State):
     print(Fore.RED + Style.BRIGHT + "**已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
 
     return{"current_ui_tree": None,
-           "last_screenshot": None,
+           "last_ui_tree": None,
            "current_action": None,
            "is_sensitive": None,
            "sensitive_reason": None,
@@ -754,7 +735,7 @@ async def run_agent(manager: ConnectionManager):
         "current_step": 0,
         "current_ui_tree": None,
         "current_action": None,
-        "last_screenshot": None,
+        "last_ui_tree": None,
         "retry_count": 0,
         "is_success": None,
         "is_sensitive": None,
