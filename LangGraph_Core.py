@@ -4,11 +4,11 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 import os, base64, json
 from Connection_Manager import ConnectionManager, manager
-from Action import Action
+from Action import *
+from FormatOutput import *
 from colorama import Fore, Style, init
 import time
 
@@ -20,11 +20,6 @@ llm = init_chat_model(      #初始化模型
     openai_api_key=os.getenv("OPENAI_API_KEY"),     #設定API_KEY
     max_retries=5
 )
-
-class Step(TypedDict):      #LLM生成步驟清單的規範
-    step_name: str  
-    #操作指令不先寫死，而是根據該步驟的名稱、擷取到的UI tree來生成
-
 
 class State(TypedDict):
     """狀態表，狀態機核心記憶體"""
@@ -45,101 +40,13 @@ class State(TypedDict):
     is_sensitive: bool | None                # 是否為敏感操作，是敏感操作時為True，否則為False
     sensitive_reason: str | None             # 該操作為敏感操作的原因
     is_confirmed: bool | None                # 使用者確認或取消，確認為True，否則為False
+    not_current_step: bool | None            # 若當前操作不為步驟清單內之步驟，則為 True，並且當前步驟不計入步驟數
+    exception_step_name: str | None          # not_current_step 為 True 時生成的臨時步驟名稱
     #上面為主執行流程所需
     task_result: str | None                  # 任務結果
     error_reason: list[str]                  # 每次失敗原因，最多三筆
     next_round_hint: str | None              # 分析失敗後給下一輪生成操作指令的提示
     
-#以下為讓LLM根據格式輸出的    結構化輸出類別
-class FormatOutput_check_requirements(BaseModel):
-    """詢問使用者需求具體細節的類別"""
-    again_check: bool = Field(
-        ...,        #省略號代表此變數必填
-        description="""請判斷使用者的指令是否缺少具體細節，
-                    例如：使用者想點一杯珍珠奶茶，卻沒有說要用哪個平台、糖度、冰的還是熱的，
-                    如有缺少，請回答True，沒有缺少的話請回答False。
-                    """
-    )
-    ask_for_user: str = Field(
-        ...,
-        description="""你是一個Android裝置的行動助理，
-                    你的工作是協助使用者完成他指定的任務。
-                    請你先判斷使用者的任務是否有缺少具體細節，
-                    例如：使用者想點一杯珍珠奶茶，卻沒有說要用哪個平台、糖度、冰的還是熱的，
-                    你需要將使用者沒說到的細節彙總成一段話再問使用者一次。
-                    例如：你要使用Foodpanda嗎，微糖少冰可以嗎。
-                    """
-    )
-class FormatOutput_ask_user(BaseModel):
-    """判斷使用者是明確說明還是含糊帶過"""
-    define_detail: bool = Field(
-        ...,
-        description="""如果明確說明就填入 True，
-                    沒有明確說明則填入 False。
-                    """
-    )
-class FormatOutput_change_dict(BaseModel):  
-    """將使用者補充的具體細節轉換成 dictory"""
-    clarified_params_json: str = Field(
-        ...,
-        description="""請將所有需要用到的細節列出來，並用合法 JSON 字串格式輸出，不要加任何說明
-                    例如：
-                    {"外送平台": "Foodpanda", "糖分": "半糖", "冰量": "少冰"}
-                    """
-    )    
-class FormatOutput_analyze(BaseModel):
-    """請LLM分析完整步驟清單的類別"""
-    total_step: list[Step] = Field(
-        ...,
-        description="""這個list是一個步驟清單，
-                    每一個dict裡面只裝著一個步驟名稱。
-                    範例：{"step_name": "開啟Foodpanda應用程式"}。
-                    """
-    )
-class FormatOutput_action_command(BaseModel):
-    """請LLM生成對應的操作指令"""
-    command: Action = Field(
-        ...,
-        description="""Action類別裡包含
-                    {
-                        action_type
-                        resource_id
-                        content_description
-                        bounds
-                        input_text
-                        scroll_direction
-                    }
-                    請生成對應的值"""
-    )
-class FormatOutput_sensitive_check(BaseModel):
-    """判斷是否為敏感操作"""
-    is_sensitive: bool = Field(
-        ...,
-        description="""請判斷以下操作指令是否屬於敏感操作，
-                    敏感操作包含：付款、確認訂單、送出、輸入密碼、刪除資料等，
-                    如果是敏感操作請回答True，否則回答False。
-                    """
-    )
-    reason: str = Field(
-        ...,
-        description="簡短說明為什麼這個操作是或不是敏感操作"
-    )
-class FormatOutput_chack_action_success(BaseModel):
-    """請LLM判斷當前步驟是否執行成功"""
-    is_success: bool = Field(
-        ...,
-        description="步驟成功填入True，失敗False"
-    )
-class FormatOutput_error_reason(BaseModel):
-    """LLM分析填入：失敗原因、下一輪之提示"""
-    error_reason: str = Field(      
-        ...,
-        description="""填入失敗原因"""
-    )
-    next_round_hint: str = Field(
-        ...,
-        description="""填入下一輪提示"""
-    )
 
 #-------------------------以下為所有節點之函式-------------------------
 
@@ -328,15 +235,11 @@ async def capture_ui_tree(state: State):
 
     #收到APP的UI Tree與截圖 -> 將收到的JSON轉為dict  
     user_response: dict = await manager.wait_for_user('ui_screen_data')   #接收APP回傳
-    print(Fore.RED + Style.BRIGHT + "**接收到 UI Tree 、 截圖")
+    print(Fore.RED + Style.BRIGHT + "**接收到 UI Tree")
 
     ui_tree: dict = user_response["ui_tree"]
-    #base64_str: str = user_response["screen_shot"]
-    #b64_clean = base64_str.split(",")[-1]           #去除base64前綴字串
-    #image_bytes = base64.b64decode(b64_clean)       #將base64字串轉成bytes
     
     return{"current_ui_tree": ui_tree}
-           #"last_screenshot": image_bytes
 
 #LLM生成操作指令
 async def generate_action_commands(state: State):
@@ -358,7 +261,7 @@ async def generate_action_commands(state: State):
         
     messages = [
         SystemMessage(content=      #系統訊息
-            """   
+            """
             你是一個 Android UI 操作代理。
 
             你的任務是：
@@ -368,7 +271,8 @@ async def generate_action_commands(state: State):
             **若當前畫面的UI Tree不能執行當前步驟的操作指令**
             - 例如：須關閉廣告視窗、有其他阻擋畫面的彈窗
             - 則以關閉這些彈窗生成操作指令
-            - 並且不將這次操作算進步驟數
+            - 並且不將這次操作算進步驟數，並將 not_current_step 填入 True
+            - 並且根據要執行的動作生成臨時的步驟名稱，填入 exception_step_name
 
             目標節點識別規則（依序判斷）：
             1. resource_id 有值且在當前畫面唯一 → 填 resource_id
@@ -401,11 +305,19 @@ async def generate_action_commands(state: State):
     response = action_command_llm.invoke(messages)
     print(Fore.RED + Style.BRIGHT + f"**已生成操作指令：{response.command}")
 
-    return{"current_action": response.command}
+    return{"current_action": response.command,
+           "not_current_step": response.not_current_step,
+           "exception_step_name": response.exception_step_name}
 
 #判斷是否是敏感操作
 async def is_sensitive_action(state: State):
     current_action = state["current_action"]
+
+    current_step_name
+    if state["not_current_step"] == True:      #若當前操作不在步驟清單內
+        current_step_name = state["exception_step_name"]
+    else:
+        current_step_name = state["total_step"][state["current_step"]]["step_name"]
 
     sensitive_llm = llm.with_structured_output(FormatOutput_sensitive_check)
     result = sensitive_llm.invoke([
@@ -420,6 +332,7 @@ async def is_sensitive_action(state: State):
             "role": "user",
             "content": f"""
                         操作指令：
+                        current_step_name: {current_step_name}
                         action_type: {current_action.action_type}
                         resource_id: {current_action.resource_id}
                         content_description: {current_action.content_description}
@@ -439,17 +352,23 @@ async def notify_user(state: State):
     current_action = state["current_action"]
     sensitive_reason = state["sensitive_reason"]
 
+    current_step_name
+    if state["not_current_step"] == True:      #若當前操作不在步驟清單內
+        current_step_name = state["exception_step_name"]
+    else:
+        current_step_name = state["total_step"][state["current_step"]]["step_name"]
+
     messages: str
     # 組成通知訊息
     if current_action.input_text == None:    #不為輸入操作時不帶入 input_text 欄位
         messages = f"""偵測到敏感操作，請確認：
+                要執行的動作名稱：{current_step_name}
                 操作類型：{current_action.action_type}
-                目標元件：{current_action.resource_id}
                 """
     else:
         messages = f"""偵測到敏感操作，請確認：
+                要執行的動作名稱：{current_step_name}
                 操作類型：{current_action.action_type}
-                目標元件：{current_action.resource_id}
                 輸入內容：{current_action.input_text}
                 """
     
@@ -460,9 +379,9 @@ async def notify_user(state: State):
 
 #等待使用者確認/取消
 async def wait_for_user_confirm(state: State):
-    user_response = await manager.wait_for_user("sensitive_confirm")   # 等待APP回傳確認或取消
+    user_response: dict = await manager.wait_for_user("sensitive_confirm")   # 等待APP回傳確認或取消
     print(Fore.RED + Style.BRIGHT + f"**已收到敏感操作確認：{user_response['request_response']}")
-    
+
     # 判斷使用者回傳的是確認還是取消
     is_confirmed = user_response["request_response"]   # True = 確認, False = 取消
     
@@ -485,9 +404,14 @@ async def screenshot_for_result(state: State):
     system_response: dict = await manager.wait_for_user("ui_screen_data")
     print(Fore.RED + Style.BRIGHT + "**收到操作後之 UI Tree")
 
-    ui_tree: str = system_response["ui_tree"]
-    current_step_name = state["total_step"][state["current_step"]]["step_name"]
+    ui_tree: dict = state["current_ui_tree"]            #操作前的 UI Tree
+    last_ui_tree: dict = system_response["ui_tree"]     #操作後回傳的UI Tree
     current_action: Action = state["current_action"]
+
+    if state["not_current_step"] == True:      #若當前操作不在步驟清單內
+        current_step_name = state["exception_step_name"]
+    else:
+        current_step_name = state["total_step"][state["current_step"]]["step_name"]
 
     check_llm = llm.with_structured_output(FormatOutput_chack_action_success)
     messages = [
@@ -496,7 +420,7 @@ async def screenshot_for_result(state: State):
             你是一個 Android UI 操作代理。
 
             你剛執行完一個步驟
-            - 請根據目前的UI Tree、執行時的步驟名稱、操作指令
+            - 請根據執行前的UI Tree、執行後的UI Tree、執行時的步驟名稱、操作指令
             - 判斷剛才的步驟是否執行成功
 
             成功則輸出: True
@@ -508,7 +432,8 @@ async def screenshot_for_result(state: State):
                 "text": f"""
                         剛剛執行的步驟名稱：{current_step_name}
                         執行的操作指令：{current_action}
-                        執行後的 UI Tree：{ui_tree}
+                        執行前的 UI Tree：{ui_tree}
+                        執行後的 UI Tree：{last_ui_tree}
                         """
             }
         ])
@@ -517,8 +442,7 @@ async def screenshot_for_result(state: State):
     print(Fore.RED + Style.BRIGHT + f"**當前步驟執行結果：{result.is_success}")
 
     return{"is_success": result.is_success,
-           "ui_tree": ui_tree}
-           #"last_screenshot": image_bytes
+           "last_ui_tree": last_ui_tree}
     
 #分析失敗原因、提供解決方法
 async def analyze_error_solution(state: State):
@@ -529,9 +453,15 @@ async def analyze_error_solution(state: State):
     print(Fore.RED + Style.BRIGHT + "**進入到錯誤分析節點")
     retry_count = state["retry_count"]
     retry_count += 1  #重試次數+1
-    current_step = state["total_step"][state["current_step"]]["step_name"]
+
+    if state["not_current_step"] == True:      #若當前操作不在步驟清單內
+        current_step_name = state["exception_step_name"]
+    else:
+        current_step_name = state["total_step"][state["current_step"]]["step_name"]
+
+    ui_tree: dict = state["current_ui_tree"]
     current_action = state["current_action"]
-    last_ui_tree = state["last_ui_tree"]
+    last_ui_tree: dict = state["last_ui_tree"]
 
     solution_llm = llm.with_structured_output(FormatOutput_error_reason)
     messages = [
@@ -548,8 +478,9 @@ async def analyze_error_solution(state: State):
             {
                 "type": "text",
                 "text": f"""
-                        步驟名稱：{current_step}
+                        步驟名稱：{current_step_name}
                         執行的操作指令：{current_action}
+                        執行前的 UI Tree：{ui_tree}
                         執行後的 UI Tree：{last_ui_tree}
                         """
             }
@@ -568,12 +499,15 @@ async def analyze_error_solution(state: State):
 #判斷任務是否執行完畢     是否需要此節點(待定)
 async def task_is_completed(state: State):
     """判斷執行完的步驟是否是最後一個步驟，若為最後一個步驟則進到收尾工作"""
-    step_count = state["current_step"]
-    step_count += 1
-    print(Fore.RED + Style.BRIGHT + "**步驟數已加 1")
-    print(Fore.RED + Style.BRIGHT + f"**目前步驟數：{step_count}")
-
-    return{"current_step": step_count}
+    if state["not_current_step"] == True:   #若當前操作不在步驟清單內，則不增加步驟數
+        print(Fore.GREEN + Style.BRIGHT + "**此步驟為額外步驟，故不增加步驟數")
+        return{}
+    else:
+        step_count = state["current_step"]
+        step_count += 1
+        print(Fore.RED + Style.BRIGHT + "**步驟數已加 1")
+        print(Fore.RED + Style.BRIGHT + f"**目前步驟數：{step_count}")
+        return{"current_step": step_count}
 
 #更新狀態機並執行下個步驟
 async def update_state_and_next_action(state: State):
@@ -585,7 +519,9 @@ async def update_state_and_next_action(state: State):
            "current_action": None,
            "is_sensitive": None,
            "sensitive_reason": None,
-           "is_confirmed": None}
+           "is_confirmed": None,
+           "not_current_step": None,
+           "exception_step_name": None}
 
 #收尾工作
 async def teardown_process(state: State):
@@ -630,6 +566,8 @@ async def teardown_process(state: State):
            "sensitive_reason": None,
            "is_confirmed": None,
            "next_round_hint": None,
+           "not_current_step": None,
+           "exception_step_name": None,
            "task_result": task_result}
 
 
@@ -741,6 +679,8 @@ async def run_agent(manager: ConnectionManager):
         "is_sensitive": None,
         "sensitive_reason": None,
         "is_confirmed": None,
+        "not_current_step": None,
+        "exception_step_name": None,
         "task_result": None,
         "error_reason": [],
         "next_round_hint": None

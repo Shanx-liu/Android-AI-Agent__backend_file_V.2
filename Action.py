@@ -1,5 +1,10 @@
-"""操作指令類別定義"""
+"""操作指令類別定義、步驟名稱類別"""
 from pydantic import BaseModel
+from typing_extensions import TypedDict
+
+class Step(TypedDict):      #LLM生成步驟清單的規範
+    step_name: str  
+    #操作指令不先寫死，而是根據該步驟的名稱、擷取到的UI tree來生成
 
 class BoundsXY(BaseModel):
     x: int      # 元件中心點 X（node.x + node.width // 2）
