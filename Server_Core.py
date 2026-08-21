@@ -6,7 +6,7 @@ import colorama
 #----------------------------此檔案為通訊層-------------------------------------
 
 #用WebSocket時，網址開頭要是 ws:// 或 wss://
-#ngrok發布命令：/ngrok/ngrok.exe http --url=unannealed-controllingly-sarai.ngrok-free.dev 8002
+#ngrok發布命令：ngrok http --url=unannealed-controllingly-sarai.ngrok-free.dev 8002
 #WebSocket 根 URL：wss://unannealed-controllingly-sarai.ngrok-free.dev/ws
 
 app = FastAPI()

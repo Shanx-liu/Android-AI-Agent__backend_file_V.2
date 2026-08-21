@@ -55,8 +55,11 @@ class FormatOutput_action_command(BaseModel):
         description="""Action類別裡包含
                     {
                         action_type
+                        full_resource_id
                         resource_id
                         content_description
+                        hint_text
+                        text
                         bounds
                         input_text
                         scroll_direction

@@ -13,8 +13,11 @@ class BoundsXY(BaseModel):
 class Action(BaseModel):            #每次根據UI tree生成的操作指令
     """操作指令細節"""
     action_type: str                # "click" / "set_text" / "scroll" / "global_back"
+    full_resource_id: str | None    # 完整 ViewId
     resource_id: str | None         # 優先使用，來自 UiNode.resourceId
     content_description: str | None # 次選：桌面圖示、無障礙標籤場景
+    hint_text: str | None           # 節點的 hint 與 content_description 分開
+    text: str | None                # 節點的 text
     bounds: BoundsXY | None         # resource_id 不存在時的 fallback
     input_text: str | None          # 僅 set_text 時使用
     scroll_direction: str | None    # 僅 scroll 時使用："up"/"down"/"left"/"right"

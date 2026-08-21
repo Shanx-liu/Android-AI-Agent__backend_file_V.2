@@ -1,16 +1,51 @@
 from dotenv import load_dotenv
-from typing import Annotated
+from typing import Annotated, Callable
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, message_to_dict, BaseMessage
 from typing_extensions import TypedDict
-import os, base64, json
+import os, base64, json, asyncio
 from Connection_Manager import ConnectionManager, manager
 from Action import *
 from FormatOutput import *
 from colorama import Fore, Style, init
 import time
+import functools, operator
+from datetime import datetime
+from pathlib import Path
+from copy import deepcopy
+from dataclasses import is_dataclass, asdict
+
+#----------------------以下為流程紀錄---------------------------
+def logged_node(node_name: str):        #裝飾器函式
+    def decorator(func: Callable):
+        @functools.wraps(func)
+        async def async_wrapper(state: dict):
+            start = time.monotonic()
+            result = await func(state)
+            duration_ms = round((time.monotonic() - start) * 1000, 1)   #紀錄步驟花費時間
+
+            # 合併出「這個節點執行完當下」的完整 state 快照
+            # （state 是這個節點執行前的內容，result 是它回傳要更新的欄位）
+            snapshot = {**state, **result}
+            snapshot.pop("execution_log", None)  # 避免快照裡巢狀塞自己，太肥
+ 
+            entry = {
+                "node": node_name,
+                "timestamp": datetime.now().isoformat(),
+                "duration_ms": duration_ms,
+                "output": snapshot,
+            }
+            # 只回傳 execution_log 的「新增這一筆」，
+            # operator.add 會自動幫你 append 到 State 原本的 list 後面
+            result["execution_log"] = [entry]
+            return result
+ 
+        return async_wrapper
+ 
+    return decorator
+#----------------------------------------------------------------
 
 init(autoreset=True)   #終端機字體顏色設定
 load_dotenv()
@@ -46,11 +81,13 @@ class State(TypedDict):
     task_result: str | None                  # 任務結果
     error_reason: list[str]                  # 每次失敗原因，最多三筆
     next_round_hint: str | None              # 分析失敗後給下一輪生成操作指令的提示
+    execution_log: Annotated[list[dict], operator.add]
     
 
 #-------------------------以下為所有節點之函式-------------------------
 
 #缺少具體細節
+@logged_node("缺少具體細節")    #裝飾器
 async def check_requirements_completeness(state: State):
     """將使用者指令丟給LLM分析是否缺少具體細節，並將詢問訊息傳給APP"""
 
@@ -95,6 +132,7 @@ async def check_requirements_completeness(state: State):
         }
 
 #詢問使用者
+@logged_node("詢問使用者")
 async def ask_user_for_details(state: State):
     """呼叫LLM判斷使用者是否有說具體細節，還是說"你決定就好"等等的模糊指令，
     如有說明確細節則將使用者補充的細節轉換成dict格式，放進補全的參數"""
@@ -137,6 +175,7 @@ async def ask_user_for_details(state: State):
            "messages": [{"role": "user", "content": user_response["detail_response"]}]}
 
 #使用預設值
+@logged_node("使用預設值")
 async def apply_default_parameters(state: State):
     """使用者若沒說明確細節則進到此節點，請LLM生成預設的值填入補全參數"""
     print(Fore.RED + Style.BRIGHT + "**進入使用預設值節點")
@@ -167,6 +206,7 @@ async def apply_default_parameters(state: State):
     return{"clarified_params": result.clarified_params_json}
 
 #LLM分析指令回傳步驟清單
+@logged_node("LLM分析指令回傳步驟清單")
 async def llm_analyze_command(state: State):
     """將使用者的原始指令、補全的參數丟給LLM分析，並生成一份步驟清單"""
 
@@ -185,7 +225,8 @@ async def llm_analyze_command(state: State):
 
                         生成完整且具體的操作流程。
 
-                        **每個步驟必須精細到能用單一指令操作的程度**
+                        **步驟粒度必須精細到能用單一指令操作的程度**
+                        - 例如要在搜尋欄輸入文字時，可以拆解成先點擊搜尋框取得焦點，再輸入文字
                         
                         輸出格式必須為：
                         [
@@ -215,6 +256,7 @@ async def llm_analyze_command(state: State):
     return {"total_step": result.total_step}
 
 #通知APP任務開始
+@logged_node("通知APP任務開始")
 async def notify_task_start(state: State):
     """傳送開始訊息告訴APP端開始執行任務"""
     await manager.send_start_messages()
@@ -226,10 +268,11 @@ async def notify_task_start(state: State):
     return{"user_confirm_start": user_response["user_confirm"]}
 
 #讀取UI Tree
+@logged_node("讀取UI Tree")
 async def capture_ui_tree(state: State):
     """傳送訊息告訴APP讀取UI tree與截圖，並將收到的截圖與UI Tree放入state"""
 
-    time.sleep(4)
+    time.sleep(3)
     await manager.send_read_messages()
     print(Fore.RED + Style.BRIGHT + "**已送出讀取UI通知")
 
@@ -242,6 +285,7 @@ async def capture_ui_tree(state: State):
     return{"current_ui_tree": ui_tree}
 
 #LLM生成操作指令
+@logged_node("LLM生成操作指令")
 async def generate_action_commands(state: State):
     """將當前步驟的步驟名稱、UI Tree、截圖丟給LLM生成操作指令"""
 
@@ -277,13 +321,16 @@ async def generate_action_commands(state: State):
             目標節點識別規則（依序判斷）：
             1. resource_id 有值且在當前畫面唯一 → 填 resource_id
             2. resource_id 為通用值（如 "icon"）或重複 → 改填 content_description
-            3. 兩者皆無或不可靠 → 填 bounds 座標
+            3. 不管前面兩者是否有填入，都要填 bounds 座標
 
             嚴格遵守格式：
             {
                 "action_type": "click" | "set_text" | "scroll" | "global_back",
+                "full_resource_id": 完整的 ViewId,
                 "resource_id": "Node 的 resourceID",
                 "content_description": "如有多個resourceID重複時填入",
+                "hint_text": 節點的 hint,
+                "text": 節點的 text,
                 "bounds: BoundsXY": "resource_ID不存在時填入",
                 "input_text": "<僅 set_text 時填入，其餘為 null>",
                 "scroll_direction": "僅 scroll 時使用: "up"/"down"/"left"/"right"
@@ -310,10 +357,11 @@ async def generate_action_commands(state: State):
            "exception_step_name": response.exception_step_name}
 
 #判斷是否是敏感操作
+@logged_node("判斷是否是敏感操作")
 async def is_sensitive_action(state: State):
     current_action = state["current_action"]
 
-    current_step_name
+    current_step_name = ""
     if state["not_current_step"] == True:      #若當前操作不在步驟清單內
         current_step_name = state["exception_step_name"]
     else:
@@ -348,6 +396,7 @@ async def is_sensitive_action(state: State):
             "sensitive_reason": result.reason}
 
 #停在該畫面、並通知使用者
+@logged_node("通知使用者")
 async def notify_user(state: State):
     current_action = state["current_action"]
     sensitive_reason = state["sensitive_reason"]
@@ -378,6 +427,7 @@ async def notify_user(state: State):
     return{}
 
 #等待使用者確認/取消
+@logged_node("等待使用者確認/取消")
 async def wait_for_user_confirm(state: State):
     user_response: dict = await manager.wait_for_user("sensitive_confirm")   # 等待APP回傳確認或取消
     print(Fore.RED + Style.BRIGHT + f"**已收到敏感操作確認：{user_response['request_response']}")
@@ -388,6 +438,7 @@ async def wait_for_user_confirm(state: State):
     return {"is_confirmed": is_confirmed}
 
 #發送操作指令
+@logged_node("發送操作指令")
 async def send_action_command(state: State):
     """將當前步驟指令傳送給前端APP"""
     action = state["current_action"]
@@ -397,6 +448,7 @@ async def send_action_command(state: State):
     return{}
 
 #手機截圖後回傳、並判斷成功與否
+@logged_node("判斷成功與否")
 async def screenshot_for_result(state: State):
     """手機執行操作後截圖回傳，判斷該步驟是否執行成功"""
     print(Fore.RED + Style.BRIGHT + f"進入接收 UI Tree判斷是否成功節點")
@@ -445,6 +497,7 @@ async def screenshot_for_result(state: State):
            "last_ui_tree": last_ui_tree}
     
 #分析失敗原因、提供解決方法
+@logged_node("分析失敗原因、提供解決方法")
 async def analyze_error_solution(state: State):
     """步驟執行失敗後進到此節點，判斷失敗原因並記錄到 state[error_reason]"""
     #將失敗原因帶入下一輪的"生成操作指令"節點，提示LLM上次的操作失敗了，不要用重複的指令
@@ -497,6 +550,7 @@ async def analyze_error_solution(state: State):
            "next_round_hint": result.next_round_hint}
 
 #判斷任務是否執行完畢     是否需要此節點(待定)
+@logged_node("判斷任務是否執行完畢")
 async def task_is_completed(state: State):
     """判斷執行完的步驟是否是最後一個步驟，若為最後一個步驟則進到收尾工作"""
     if state["not_current_step"] == True:   #若當前操作不在步驟清單內，則不增加步驟數
@@ -510,6 +564,7 @@ async def task_is_completed(state: State):
         return{"current_step": step_count}
 
 #更新狀態機並執行下個步驟
+@logged_node("更新狀態機並執行下個步驟")
 async def update_state_and_next_action(state: State):
     """清空動態欄位，繼續下一步驟"""
     print(Fore.RED + Style.BRIGHT + "**已清空所有動態欄位")
@@ -524,6 +579,7 @@ async def update_state_and_next_action(state: State):
            "exception_step_name": None}
 
 #收尾工作
+@logged_node("收尾工作")
 async def teardown_process(state: State):
     """在APP顯示執行結果、失敗原因、過程log，通知APP關閉進程"""
     print(Fore.RED + Style.BRIGHT + "**已進入收尾工作")
@@ -558,6 +614,8 @@ async def teardown_process(state: State):
 
     await manager.send_end_messages(task_result, task_process, error_reason)
     print(Fore.RED + Style.BRIGHT + "**已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
+
+    export_task_json(state)     #匯出 Log Json檔
 
     return{"current_ui_tree": None,
            "last_ui_tree": None,
@@ -683,7 +741,8 @@ async def run_agent(manager: ConnectionManager):
         "exception_step_name": None,
         "task_result": None,
         "error_reason": [],
-        "next_round_hint": None
+        "next_round_hint": None,
+        "execution_log": []
     }
 
     state = await graph.ainvoke(initial_state)     #初始化狀態表
@@ -691,6 +750,7 @@ async def run_agent(manager: ConnectionManager):
 
 #----------------------以下為圖的繪製---------------------------
 if __name__ == "__main__":
+    """直接執行主程式時"""
     try:
         png_data = graph.get_graph().draw_mermaid_png()
         with open("graph_AI.png", "wb") as f:
@@ -698,3 +758,80 @@ if __name__ == "__main__":
         print("已輸出 graph_AI.png")
     except Exception:
         pass
+
+
+#----------------------以下為匯出流程紀錄Json檔---------------------------
+def export_task_json(final_state: dict, filename: str | None = "agent_log.json") -> Path:
+    """
+    final_state: teardown 節點拿到的完整 state（含 execution_log）
+    filename: 輸出的 .json 路徑，例如 "my_agent_log".json"
+    """
+    state = deepcopy(final_state)
+
+    # messages 轉換
+    """
+    if "messages" in state:
+        state["messages"] = [
+            message_to_dict(m) if hasattr(m, "type") else m
+            for m in state["messages"]
+        ]
+    """
+    
+    payload = {
+        "exported_at": datetime.now().isoformat(),
+        "task_result": final_state.get("task_result"),
+        "step_count": len(final_state.get("execution_log", [])),
+        "final_state": make_jsonable(final_state) 
+    }
+ 
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+ 
+    return filename
+
+#----------------------以下為自訂Json縮排格式---------------------------
+def _hanging_indent_json(obj, col: int = 0) -> str:
+    if isinstance(obj, dict):
+        if not obj:
+            return "{}"
+        inner_col = col + 1  # 對齊到 "{" 後面那一格
+        parts = []
+        for key, value in obj.items():
+            key_str = json.dumps(key, ensure_ascii=False)
+            value_str = _hanging_indent_json(value, inner_col + len(key_str) + 2)
+            parts.append(f"{key_str}: {value_str}")
+        sep = ",\n" + " " * inner_col
+        return "{" + sep.join(parts) + "}"
+ 
+    if isinstance(obj, list):
+        if not obj:
+            return "[]"
+        inner_col = col + 1  # 對齊到 "[" 後面那一格
+        parts = [_hanging_indent_json(item, inner_col) for item in obj]
+        sep = ",\n" + " " * inner_col
+        return "[" + sep.join(parts) + "]"
+ 
+    return json.dumps(obj, ensure_ascii=False)
+ #--------------------------------------------------------------------
+def make_jsonable(obj):
+    #LangChain Message
+    if isinstance(obj, BaseMessage):
+        return message_to_dict(obj)
+
+    #pydantic BaseModel (Action、BoundsXY)
+    if isinstance(obj, BaseModel):
+        return make_jsonable(obj.model_dump())
+
+    # dataclass
+    if is_dataclass(obj):
+        return make_jsonable(asdict(obj))
+
+    #dict
+    if isinstance(obj, dict):
+        return {k: make_jsonable(v) for k, v in obj.items()}
+
+    #list / tuple
+    if isinstance(obj, list):
+        return [make_jsonable(v) for v in obj]
+
+    return obj
