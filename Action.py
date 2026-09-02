@@ -2,9 +2,11 @@
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
-class Step(TypedDict):      #LLM生成步驟清單的規範
-    step_name: str  
-    #操作指令不先寫死，而是根據該步驟的名稱、擷取到的UI tree來生成
+class PlanStep(TypedDict):      #LLM生成步驟清單的規範
+    step_id: str                # 穩定 ID，例如 "s3"，不受插入/刪除影響
+    step_name: str              # 步驟描述
+    status: str                 # "pending" | "done" | "skipped" | "failed"
+    note: str | None            # 若被 replan 過，記錄原因（例如："中餐不存在，改選台式"）
 
 class BoundsXY(BaseModel):
     x: int      # 元件中心點 X（node.x + node.width // 2）
