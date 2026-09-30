@@ -11,41 +11,11 @@ from Action import *
 from FormatOutput import *
 from colorama import Fore, Style, init
 import time
-import functools, operator
-from datetime import datetime
-from pathlib import Path
-from copy import deepcopy
-from dataclasses import is_dataclass, asdict
+import operator
 
-#----------------------以下為流程紀錄---------------------------
-def logged_node(node_name: str):        #裝飾器函式
-    def decorator(func: Callable):
-        @functools.wraps(func)
-        async def async_wrapper(state: dict):
-            start = time.monotonic()
-            result = await func(state)
-            duration_ms = round((time.monotonic() - start) * 1000, 1)   #紀錄步驟花費時間
-
-            # 合併出「這個節點執行完當下」的完整 state 快照
-            # （state 是這個節點執行前的內容，result 是它回傳要更新的欄位）
-            snapshot = {**state, **result}
-            snapshot.pop("execution_log", None)  # 避免快照裡巢狀塞自己，太肥
- 
-            entry = {
-                "node": node_name,
-                "timestamp": datetime.now().isoformat(),
-                "duration_ms": duration_ms,
-                "output": snapshot,
-            }
-            # 只回傳 execution_log 的「新增這一筆」，
-            # operator.add 會自動幫你 append 到 State 原本的 list 後面
-            result["execution_log"] = [entry]
-            return result
- 
-        return async_wrapper
- 
-    return decorator
-#----------------------------------------------------------------
+# log 擷取相關的東西（logged_node 裝飾器、export_task_json、終端機輸出擷取）
+# 都搬到 logging_utils.py 去了，這裡只留呼叫進來的地方
+from logging_utils import logged_node, export_task_json
 
 init(autoreset=True)   #終端機字體顏色設定
 load_dotenv()
@@ -67,7 +37,8 @@ class State(TypedDict):
     #上面的變數為前置處理所需
     plan: list[PlanStep]                     # 取代 total_step  
     current_step_id: str | None              # 取代 current_step（用 ID 定位，不用 index）
-    current_ui_tree: dict | None             # 每步執行前讀入，步驟結束後可清除
+    current_ui_tree: dict | None             # 每步執行前讀入，步驟結束後可清除（只放 Tree 本體，即 App 端回傳的 root）
+    ui_tree_meta: dict | None                # App 端回傳的 screenWidth/screenHeight/coverageRatio/uncoveredRegions，供組 prompt 提醒用
     current_action: Action | None            # LLM 根據 UI Tree 生成，執行完後清除
     last_ui_tree: dict | None                # 最後一張螢幕截圖
     retry_count: int                         # 失敗重試次數
@@ -79,12 +50,13 @@ class State(TypedDict):
     exception_step_name: str | None          # not_current_step 為 True 時生成的臨時步驟名稱
     needs_replan: bool | None                # generate_action_commands 判斷「這步寫錯/做不到」時填 True
     replan_reason: str | None                # 對應原因
+    before_screenshot_base64: str | None     # 每步驟執行前的螢幕畫面
+    after_screenshot_base64: str | None      # 執行後的螢幕畫面
     #上面為主執行流程所需
     task_result: str | None                  # 任務結果
     error_reason: list[str]                  # 每次失敗原因，最多三筆
     next_round_hint: str | None              # 分析失敗後給下一輪生成操作指令的提示
-    history_summary: str                     # 壓縮後的歷程摘要，取代直接塞整個 execution_log
-    execution_log: Annotated[list, operator.add]   # 每個節點執行完 append 一筆紀錄；沒宣告 reducer 的話這欄位不會被正確收集
+    execution_log: Annotated[list, operator.add]   # 每個節點執行完 append 一筆紀錄；沒宣告 reducer 的話這欄位不會被正確收集（ENABLE_EXECUTION_LOG=False 時永遠是空list，見 logging_utils.py）
 
     
 #-------------------------以下為 plan 存取輔助函式-------------------------
@@ -104,7 +76,7 @@ def find_step_index(plan: list[PlanStep], step_id: str | None) -> int:
     for i, s in enumerate(plan):
         if s["step_id"] == step_id:
             return i
-    return 
+    return -1
  
 def first_pending_step_id(plan: list[PlanStep]) -> str | None:
     """找出 plan 裡第一個狀態為 pending 的 step_id，代表下一步該做的事"""
@@ -113,14 +85,59 @@ def first_pending_step_id(plan: list[PlanStep]) -> str | None:
             return s["step_id"]
     return None
  
-def get_current_step_name(state: State) -> str:
+def get_current_step_name(state: "State") -> str:
     """取得目前要顯示/紀錄用的步驟名稱：
     若目前是在處理彈窗等例外操作，用臨時步驟名稱；否則從 plan 裡查目前步驟"""
     if state.get("not_current_step") == True:
         return state.get("exception_step_name") or ""
     step = find_step(state["plan"], state["current_step_id"])
     return step["step_name"] if step else ""
- 
+
+#將圖片的base64字串轉為Langchain的image_url
+def build_image_blocks(*screenshots: tuple[str, str | None]) -> list[dict]:
+    """將 (標籤, base64字串) 組合成 LangChain HumanMessage 可用的 image content block 清單。
+    base64 為 None 或空字串時該張截圖直接略過，不會塞進訊息裡。"""
+    blocks: list[dict] = []
+    for label, b64 in screenshots:
+        if not b64:
+            continue
+        blocks.append({"type": "text", "text": f"【{label}】"})
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"}
+        })
+    return blocks
+
+#將 ui_tree_meta 轉成給 LLM 看的提醒文字
+def build_coverage_note(ui_tree_meta: dict | None) -> str:
+    """把 UI Tree 的覆蓋率資訊轉成提醒文字，插入 prompt。
+    目的：避免 LLM 把「Tree 裡沒有對應節點」誤判成「畫面上沒有這個東西」，
+    這種情況常發生在廣告、WebView、自繪 Canvas 等無障礙服務抓不到內容的區塊，
+    這時應該改用截圖上的視覺位置去推算 bounds，而不是判定該步驟做不到。"""
+    if not ui_tree_meta:
+        return ""
+
+    coverage = ui_tree_meta.get("coverageRatio")
+    regions = ui_tree_meta.get("uncoveredRegions") or []
+
+    if coverage is None or not regions:
+        return ""
+
+    region_desc = "; ".join(
+        f"x={r['x']},y={r['y']},width={r['width']},height={r['height']}"
+        for r in regions
+    )
+
+    return f"""
+        【UI Tree 覆蓋率提醒】
+        目前 UI Tree 只覆蓋了畫面約 {coverage * 100:.0f}% 的區域，
+        以下區域完全沒有對應的 UI Tree 節點（常見於廣告、WebView、自繪畫面）：
+        {region_desc}
+        如果本步驟要操作的目標剛好落在這些區域內，請直接參考截圖上的實際位置，
+        自行估算 bounds 座標並填入 command.bounds，不要因為 UI Tree 找不到節點
+        就判定 needs_replan=True。
+        """
+
 #-------------------------以下為所有節點之函式-------------------------
 
 #缺少具體細節
@@ -279,7 +296,7 @@ async def llm_analyze_command(state: State):
 
                         注意：
                         - 每個步驟要具體
-                        - 要包含操作相關參數（例如甜度、冰量）
+                        - 要包含參數相關操作（例如甜度、冰量）
                         - 不要輸出多餘說明
                         """
         },
@@ -309,7 +326,7 @@ async def notify_task_start(state: State):
     print(Fore.RED + Style.BRIGHT + "**已送出任務開始訊息給前端")
 
     user_response: dict = await manager.wait_for_user('user_confirm_start')
-    print(Fore.RED + Style.BRIGHT + f"**接收到使用者確認/取消：{user_response['user_confirm']}")
+    print(Fore.RED + Style.BRIGHT + f"  **接收到使用者確認/取消：{user_response['user_confirm']}")
 
     return{"user_confirm_start": user_response["user_confirm"]}
 
@@ -323,12 +340,37 @@ async def capture_ui_tree(state: State):
     print(Fore.RED + Style.BRIGHT + "**已送出讀取UI通知")
 
     #收到APP的UI Tree與截圖 -> 將收到的JSON轉為dict  
-    user_response: dict = await manager.wait_for_user('ui_screen_data')   #接收APP回傳
-    print(Fore.RED + Style.BRIGHT + "**接收到 UI Tree")
+    user_response: dict = await manager.wait_for_user('ui_screen_data')   
+    print(Fore.RED + Style.BRIGHT + "   **接收到 UI Tree")
 
-    ui_tree: dict = user_response["ui_tree"]
+    ui_tree_result = user_response["ui_tree"]
+
+    if isinstance(ui_tree_result, str):
+        try:
+            ui_tree_result = json.loads(ui_tree_result)
+        except json.JSONDecodeError:
+            print(Fore.CYAN + Style.BRIGHT + "   **警告：ui_tree 是無法解析的字串，視為空 Tree")
+            ui_tree_result = {}
+    # App 端現在回傳 {screenWidth, screenHeight, coverageRatio, uncoveredRegions, root}，
+    # 樹狀結構本體在 root 底下，這裡拆開存，current_ui_tree 維持只放 Tree 本體，
+    # 不動到下游所有 json.dumps(ui_tree) 的地方
+    ui_tree: dict | None = ui_tree_result.get("root")
+    ui_tree_meta: dict = {
+        "screenWidth": ui_tree_result.get("screenWidth"),
+        "screenHeight": ui_tree_result.get("screenHeight"),
+        "coverageRatio": ui_tree_result.get("coverageRatio"),
+        "uncoveredRegions": ui_tree_result.get("uncoveredRegions") or [],
+    }
+    before_screenshot_base64: str | None = user_response.get("screen_shot")   #操作前的螢幕截圖(base64)
+    print(Fore.RED + Style.BRIGHT +
+          f"    **接收到操作前截圖，長度：{len(before_screenshot_base64) if before_screenshot_base64 else 0}")
+
+    print(Fore.RED + Style.BRIGHT +
+          f"    **UI Tree 覆蓋率：{ui_tree_meta['coverageRatio']}，未覆蓋區域數：{len(ui_tree_meta['uncoveredRegions'])}")
     
-    return{"current_ui_tree": ui_tree}
+    return{"current_ui_tree": ui_tree,
+           "ui_tree_meta": ui_tree_meta,
+           "before_screenshot_base64": before_screenshot_base64}
 
 #LLM生成操作指令
 @logged_node("LLM生成操作指令")
@@ -341,7 +383,10 @@ async def generate_action_commands(state: State):
     step_name: str = current_step["step_name"]
     remaining_steps = [s["step_name"] for s in plan if s["status"] == "pending"]
     ui_tree = state["current_ui_tree"]
-    params: dict = state["clarified_params"] or {}
+    ui_tree_meta = state.get("ui_tree_meta")
+    params: dict = state.get("clarified_params") or {}
+    before_screenshot_base64 = state.get("before_screenshot_base64")
+    coverage_note = build_coverage_note(ui_tree_meta)
     
     action_command_llm = llm.with_structured_output(FormatOutput_action_command)
 
@@ -360,8 +405,15 @@ async def generate_action_commands(state: State):
             你是一個 Android UI 操作代理。
 
             你的任務是：
-            - 根據目前的步驟名稱、提供的 UI Tree
+            - 根據使用者的原始需求、目前的步驟名稱、提供的 UI Tree、以及當下畫面的螢幕截圖
             - 輸出「唯一一個」操作指令(JSON格式)
+
+            螢幕截圖使用原則：
+            - 螢幕截圖 是主要依據，UI Tree是輔助判斷用的視覺參考
+            - 當 UI Tree 裡的文字描述不夠明確（例如多個元件敘述相似、
+              resource_id 是通用值），請對照截圖上的實際版面位置、顏色、圖示外觀，
+              幫助你判斷究竟是畫面上的哪一個元件
+            - 若沒有提供截圖，則單純依 UI Tree 判斷即可
 
             **情況一：畫面上有東西暫時擋住操作**
             - 例如：須關閉廣告視窗、有其他阻擋畫面的彈窗
@@ -401,7 +453,7 @@ async def generate_action_commands(state: State):
             }
             禁止輸出任何額外說明。          
             """),
-        HumanMessage(content=[      #人類訊息(放步驟名稱、UI Tree)
+        HumanMessage(content=[      #人類訊息(放步驟名稱、UI Tree、截圖)
             {
                 "type": "text",
                 "text": f"""
@@ -410,16 +462,18 @@ async def generate_action_commands(state: State):
                         目前要執行的步驟：{step_name}
                         計畫中尚未完成的其他步驟：{remaining_steps}
                         {failure_content}
+                        {coverage_note}
                         當前 UI Tree (JSON)：
                         {json.dumps(ui_tree, ensure_ascii=False, indent=2)}
                         """
-            }
+            },
+            *build_image_blocks(("目前畫面截圖", before_screenshot_base64))
         ])
     ]
     response = action_command_llm.invoke(messages)
     print(Fore.RED + Style.BRIGHT + f"**已生成操作指令：{response.command}")
     if response.needs_replan:
-        print(Fore.YELLOW + Style.BRIGHT + f"**此步驟需要重新規劃，原因：{response.replan_reason}")
+        print(Fore.YELLOW + Style.BRIGHT + f"   **此步驟需要重新規劃，原因：{response.replan_reason}")
 
     return{"current_action": response.command,
            "not_current_step": response.not_current_step,
@@ -430,7 +484,7 @@ async def generate_action_commands(state: State):
 #重新規劃步驟描述節點
 @logged_node("重新規劃步驟描述")
 async def replan_step_name(state: State):
-    #這步失敗的原因」「原始需求/參數」「plan 其餘內容」丟給 LLM，讓它回傳一個修改指令
+    #這步失敗的「原因」「原始需求/參數」「plan 其餘內容」丟給 LLM，讓它回傳一個修改指令
     print(Fore.RED + Style.BRIGHT + f"**已進入重新規劃步驟節點")
 
     step_id = state["current_step_id"]
@@ -441,17 +495,31 @@ async def replan_step_name(state: State):
     user_command = state["user_command"]
     clarified_params = state.get("clarified_params") or {}
     ui_tree = state.get("current_ui_tree")    #一定要給實際畫面，否則只能盲寫、寫出模糊的條件句
-
-    print(Fore.RED + Style.BRIGHT + f"**須重規劃的步驟 {target_step}")
+    before_screenshot_base64 = state.get("before_screenshot_base64")   #同一畫面的截圖，輔助判斷用
+    
+    print(Fore.RED + Style.BRIGHT + f"  **須重規劃的步驟 {target_step}")
 
     replan_llm = llm.with_structured_output(FormatOutput_replan)
     result = replan_llm.invoke([
-        {
-            "role": "system",
-            "content": """請你根據使用者的原始需求、補全的參數、需要重新規畫的原因、
-                       plan的其餘內容、以及「目前畫面實際的 UI Tree」，
+        SystemMessage(content="""請你根據使用者的原始需求、補全的參數、需要重新規畫的原因、
+                       plan的其餘內容、以及「目前畫面實際的 UI Tree 與螢幕截圖」，
                        來重新規畫需要的步驟描述。
 
+                       螢幕截圖使用原則：
+                       螢幕截圖 是主要依據，UI Tree是輔助你確認畫面實際版面配置、
+                       文字/圖示是否真的存在的視覺參考，兩者有衝突時以 螢幕截圖 為準；
+                       若沒有提供截圖，則單純依 UI Tree 判斷即可。
+                       來重新規畫需要的步驟描述。
+
+                       **第一步，請先判斷：目前畫面顯示的進度，是不是其實已經超過這個步驟了？**
+                       例如目前步驟是「開啟記帳程式」，但 UI Tree 顯示畫面早就在填寫表單、
+                       甚至已經該按「儲存」——而「儲存」剛好是 plan 裡後面某個 pending 步驟的內容。
+                       這代表中間的步驟很可能已經透過先前的操作悄悄完成了，此時「不要」用 replace
+                       把目前這步改寫成「儲存」（那樣會讓中間所有步驟被永遠跳過、必填欄位沒填就硬按儲存）。
+                       請改成把 matches_later_step_id 填成那個「後面的 step_id」，讓系統把指標
+                       直接跳過去，而不是不斷覆寫同一個步驟。
+
+                       **如果不是上述情況**，才依照下面的方式處理：
                        請優先選擇 replace（換一個更符合畫面現況、但仍能達成使用者目標的描述），
                        只有在必須「多做一步」或「這步根本不需要」時，才用 insert_before / insert_after / skip。
 
@@ -464,11 +532,11 @@ async def replan_step_name(state: State):
                          不用預先規劃畫面切換後的步驟——那是之後每一輪重新讀取 UI Tree 後才需要決定的事
                        - 如果目前的 UI Tree 顯示的其實是更早的中間頁面（例如還在選單、還沒進到表單），
                          new_step_name 就只描述「這一頁該點的下一個東西」就好，不用一次規劃到最終目標
-                       """
-        },
-        {
-            "role": "user",
-            "content": f"""
+                       """),
+        HumanMessage(content=[
+            {
+                "type": "text",
+                "text": f"""
                         需重新規畫的步驟：{target_step}
                         使用者原始需求：{user_command}
                         補全的參數：{clarified_params}
@@ -478,9 +546,11 @@ async def replan_step_name(state: State):
                         目前畫面實際的 UI Tree（請以此為準，判斷現在畫面上實際有什麼）：
                         {json.dumps(ui_tree, ensure_ascii=False, indent=2)}
                         """
-        }
+            },
+            *build_image_blocks(("目前畫面截圖", before_screenshot_base64))
+        ])
     ])
-    print(Fore.RED + Style.BRIGHT + f"**重新規劃結果：{result}")
+    print(Fore.RED + Style.BRIGHT + f"  **重新規劃結果：{result}")
 
     #依 LLM 的決定產生新的 step_id，避免跟現有步驟撞名
     existing_ids = {int(s["step_id"][1:]) for s in plan if s["step_id"][1:].isdigit()}
@@ -496,6 +566,24 @@ async def replan_step_name(state: State):
         idx = target_index if target_index != -1 else 0
 
     next_step_id = step_id     #預設維持原本要執行的那一步
+
+    if result.matches_later_step_id:
+        later_idx = find_step_index(plan, result.matches_later_step_id)
+        if later_idx != -1 and later_idx > target_index:
+            #目前步驟到 later_idx 之前的所有步驟，判定為已透過先前操作完成，
+            #標記為 done 並附上 note 說明這是推測來的、不是真的被逐一驗證過，方便之後除錯
+            for i in range(target_index, later_idx):
+                plan[i] = {**plan[i], "status": "done",
+                           "note": f"畫面進度顯示已超前，推測此步驟已隨先前操作完成（{result.reason}）"}
+            next_step_id = plan[later_idx]["step_id"]
+            print(Fore.YELLOW + Style.BRIGHT +
+                  f"**偵測到進度超前，從 {step_id} 直接跳到 {next_step_id}，"
+                  f"中間 {later_idx - target_index} 個步驟標記為已完成")
+            return {"plan": plan,
+                    "current_step_id": next_step_id,
+                    "needs_replan": None,
+                    "replan_reason": None}
+        #later_idx 找不到或不在後面，視為 LLM 給的無效值，忽略，走下面正常流程
 
     if result.action == "replace":
         plan[idx] = {**plan[idx],
@@ -552,8 +640,8 @@ async def is_sensitive_action(state: State):
         }
     ])
     print(Fore.RED + Style.BRIGHT + "**已判斷是否為敏感操作")
-    print(Fore.YELLOW + Style.BRIGHT + f"**是否為敏感操作：{result.is_sensitive}")
-    print(Fore.YELLOW + Style.BRIGHT + f"**原因：{result.reason}")
+    print(Fore.YELLOW + Style.BRIGHT + f"   **是否為敏感操作：{result.is_sensitive}")
+    print(Fore.YELLOW + Style.BRIGHT + f"   **原因：{result.reason}")
 
     return {"is_sensitive": result.is_sensitive,
             "sensitive_reason": result.reason}
@@ -568,16 +656,16 @@ async def notify_user(state: State):
     messages: str
     # 組成通知訊息
     if current_action.input_text == None:    #不為輸入操作時不帶入 input_text 欄位
-        messages = f"""偵測到敏感操作，請確認：
-                要執行的動作名稱：{current_step_name}
-                操作類型：{current_action.action_type}
-                """
+        messages = f"""
+                    要執行的動作名稱：{current_step_name}
+                    操作類型：{current_action.action_type}
+                    """
     else:
-        messages = f"""偵測到敏感操作，請確認：
-                要執行的動作名稱：{current_step_name}
-                操作類型：{current_action.action_type}
-                輸入內容：{current_action.input_text}
-                """
+        messages = f"""
+                    要執行的動作名稱：{current_step_name}
+                    操作類型：{current_action.action_type}
+                    輸入內容：{current_action.input_text}
+                    """
     
     # 傳送通知給APP端（含截圖與訊息）
     await manager.send_action_check(messages, sensitive_reason)
@@ -612,13 +700,17 @@ async def screenshot_for_result(state: State):
     print(Fore.RED + Style.BRIGHT + f"進入接收 UI Tree判斷是否成功節點")
 
     system_response: dict = await manager.wait_for_user("ui_screen_data")
-    print(Fore.RED + Style.BRIGHT + "**收到操作後之 UI Tree")
+    print(Fore.RED + Style.BRIGHT + "   **收到操作後之 UI Tree")
 
     ui_tree: dict = state["current_ui_tree"]            #操作前的 UI Tree
     last_ui_tree: dict = system_response["ui_tree"]     #操作後回傳的UI Tree
     current_action: Action = state["current_action"]
     current_step_name = get_current_step_name(state)
-
+    before_screenshot_base64 = state.get("before_screenshot_base64")   #操作前的截圖(已存於state)
+    after_screenshot_base64: str | None = system_response.get("screen_shot")   #操作後回傳的截圖(base64)
+    print(Fore.RED + Style.BRIGHT +
+          f"    **接收到操作後截圖，長度：{len(after_screenshot_base64) if after_screenshot_base64 else 0}")
+    
     check_llm = llm.with_structured_output(FormatOutput_chack_action_success)
     messages = [
         SystemMessage(content=
@@ -626,8 +718,15 @@ async def screenshot_for_result(state: State):
             你是一個 Android UI 操作代理。
 
             你剛執行完一個步驟
-            - 請根據執行前的UI Tree、執行後的UI Tree、執行時的步驟名稱、操作指令
+            - 請根據執行前的UI Tree、執行後的UI Tree、執行時的步驟名稱、操作指令、
+              以及操作前後的螢幕截圖
             - 判斷剛才的步驟是否執行成功
+
+            螢幕截圖使用原則：
+            - 螢幕截圖 是主要依據，操作前後的UI Tree是輔助你比對的文字/結構
+              是否真的照預期改變（例如彈窗是否消失、頁面是否切換、輸入框是否真的有出現文字）
+            - 兩者有衝突時，以 螢幕截圖 的實際內容為準
+            - 若沒有提供截圖，則單純依 UI Tree 判斷即可
 
             成功則輸出: True
             失敗則輸出: False
@@ -641,14 +740,19 @@ async def screenshot_for_result(state: State):
                         執行前的 UI Tree：{ui_tree}
                         執行後的 UI Tree：{last_ui_tree}
                         """
-            }
+            },
+            *build_image_blocks(
+                ("操作前畫面截圖", before_screenshot_base64),
+                ("操作後畫面截圖", after_screenshot_base64)
+            )
         ])
     ]
     result = check_llm.invoke(messages)
-    print(Fore.RED + Style.BRIGHT + f"**當前步驟執行結果：{result.is_success}")
+    print(Fore.CYAN + Style.BRIGHT + f"  **當前步驟執行結果：{result.is_success}")
 
     return{"is_success": result.is_success,
-           "last_ui_tree": last_ui_tree}
+           "last_ui_tree": last_ui_tree,
+           "after_screenshot_base64": after_screenshot_base64}
     
 #分析失敗原因、提供解決方法
 @logged_node("分析失敗原因、提供解決方法")
@@ -665,6 +769,8 @@ async def analyze_error_solution(state: State):
     ui_tree: dict = state["current_ui_tree"]
     current_action = state["current_action"]
     last_ui_tree: dict = state["last_ui_tree"]
+    before_screenshot_base64 = state.get("before_screenshot_base64")
+    after_screenshot_base64 = state.get("after_screenshot_base64")
 
     solution_llm = llm.with_structured_output(FormatOutput_error_reason)
     messages = [
@@ -674,8 +780,15 @@ async def analyze_error_solution(state: State):
 
             剛剛執行一個操作時失敗了
 
-            請你根據提供的步驟名稱、執行後的UI Tree、操作指令
+            請你根據提供的步驟名稱、執行前後的UI Tree、操作指令、
+            以及操作前後的螢幕截圖，
             判斷操作的失敗原因，並提供一個提示告訴下一輪生成指令時要注意的地方
+
+            螢幕截圖使用原則：
+            - 螢幕截圖 是主要依據，UI Tree能幫助你判斷失敗的細節線索
+              （例如是否跳出未預期的彈窗、頁面是否根本沒有切換、
+              點擊位置是否偏移到其他元件上）
+            - 兩者有衝突時以 螢幕截圖 為準；若沒有提供截圖，則單純依 UI Tree 判斷即可
             """),
         HumanMessage(content=[ 
             {
@@ -686,11 +799,15 @@ async def analyze_error_solution(state: State):
                         執行前的 UI Tree：{ui_tree}
                         執行後的 UI Tree：{last_ui_tree}
                         """
-            }
+            },
+            *build_image_blocks(
+                ("操作前畫面截圖", before_screenshot_base64),
+                ("操作後畫面截圖", after_screenshot_base64)
+            )
         ])
     ]
     result = solution_llm.invoke(messages)
-    print(Fore.RED + Style.BRIGHT + f"**當前步驟失敗原因：{result.error_reason}")
+    print(Fore.RED + Style.BRIGHT + f"  **當前步驟失敗原因：{result.error_reason}")
     
     error_reason = state["error_reason"]
     error_reason.append(result.error_reason)    #將LLM分析的失敗原因新增至 state 的 error_reason
@@ -725,6 +842,7 @@ async def update_state_and_next_action(state: State):
     next_step_id = first_pending_step_id(state["plan"])
 
     return{"current_ui_tree": None,
+           "ui_tree_meta": None,
            "last_ui_tree": None,
            "current_action": None,
            "is_sensitive": None,
@@ -735,7 +853,9 @@ async def update_state_and_next_action(state: State):
            "needs_replan": None,
            "replan_reason": None,
            "current_step_id": next_step_id,
-           "retry_count": 0}    #換下一個步驟了，重試次數歸零，不要沿用上一步殘留的次數
+           "retry_count": 0,    #換下一個步驟了，重試次數歸零，不要沿用上一步殘留的次數
+           "before_screenshot_base64": None,
+           "after_screenshot_base64": None}
 
 #收尾工作
 @logged_node("收尾工作")
@@ -744,7 +864,7 @@ async def teardown_process(state: State):
     print(Fore.RED + Style.BRIGHT + "**已進入收尾工作")
     
     if state["user_confirm_start"] == False:    #當使用者自行取消時觸發這段
-        print(Fore.RED + Style.BRIGHT + "**使用者自行取消任務**")
+        print(Fore.RED + Style.BRIGHT + "   **使用者自行取消任務**")
         await manager.send_user_cancel_messages("您已取消任務！")
 
     error_messages: list = state["error_reason"].copy()
@@ -775,10 +895,11 @@ async def teardown_process(state: State):
             error_reason += f"第{i}次失敗原因：{message}\n"
 
     await manager.send_end_messages(task_result, task_process, error_reason)
-    print(Fore.RED + Style.BRIGHT + "**已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
+    print(Fore.RED + Style.BRIGHT + "   **已將任務結果、執行步數、失敗原因(若失敗)，傳給APP")
 
     final_updates = {
         "current_ui_tree": None,
+        "ui_tree_meta": None,
         "last_ui_tree": None,
         "current_action": None,
         "is_sensitive": None,
@@ -790,6 +911,8 @@ async def teardown_process(state: State):
         "needs_replan": None,
         "replan_reason": None,
         "task_result": task_result,
+        "before_screenshot_base64": None,
+        "after_screenshot_base64": None,
     }
 
     #匯出 Log Json 檔時要用「合併過 task_result 等欄位之後」的完整 state，
@@ -842,8 +965,6 @@ graph_builder.add_conditional_edges(
     lambda state: state.get("user_confirm_start"),
     {True: "capture_ui_tree", False: "teardown_process"}
 )
-#git commit -m "加入記錄每一步Log的功能，新增replan節點在'生成操作指令'之後，'判斷敏感操作之前'若'生成操作指令'節點判斷需要重新規劃步驟則進到replan節點，replan完後再次進入'生成操作指令'節點" 
-#以下為主流程邊的連接----------------------------------
 graph_builder.add_edge("capture_ui_tree", "generate_action_commands")
 graph_builder.add_conditional_edges(
     "generate_action_commands",
@@ -908,8 +1029,11 @@ async def run_agent(manager: ConnectionManager):
         "plan": [],
         "current_step_id": None,
         "current_ui_tree": None,
+        "ui_tree_meta": None,
         "current_action": None,
         "last_ui_tree": None,
+        "before_screenshot_base64": None,
+        "after_screenshot_base64": None,
         "retry_count": 0,
         "is_success": None,
         "is_sensitive": None,
@@ -922,7 +1046,6 @@ async def run_agent(manager: ConnectionManager):
         "task_result": None,
         "error_reason": [],
         "next_round_hint": None,
-        "history_summary": "",
         "execution_log": []
     }
 
@@ -940,79 +1063,3 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-
-#----------------------以下為匯出流程紀錄Json檔---------------------------
-def export_task_json(final_state: dict, filename: str | None = "agent_log.json") -> Path:
-    """
-    final_state: teardown 節點拿到的完整 state（含 execution_log）
-    filename: 輸出的 .json 路徑，例如 "my_agent_log".json"
-    """
-    state = deepcopy(final_state)
-
-    # messages 轉換
-    """
-    if "messages" in state:
-        state["messages"] = [
-            message_to_dict(m) if hasattr(m, "type") else m
-            for m in state["messages"]
-        ]
-    """
-    
-    payload = {
-        "exported_at": datetime.now().isoformat(),
-        "task_result": final_state.get("task_result"),
-        "step_count": len(final_state.get("execution_log", [])),
-        "final_state": make_jsonable(final_state) 
-    }
- 
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
- 
-    return filename
-
-#----------------------以下為自訂Json縮排格式---------------------------
-def _hanging_indent_json(obj, col: int = 0) -> str:
-    if isinstance(obj, dict):
-        if not obj:
-            return "{}"
-        inner_col = col + 1  # 對齊到 "{" 後面那一格
-        parts = []
-        for key, value in obj.items():
-            key_str = json.dumps(key, ensure_ascii=False)
-            value_str = _hanging_indent_json(value, inner_col + len(key_str) + 2)
-            parts.append(f"{key_str}: {value_str}")
-        sep = ",\n" + " " * inner_col
-        return "{" + sep.join(parts) + "}"
- 
-    if isinstance(obj, list):
-        if not obj:
-            return "[]"
-        inner_col = col + 1  # 對齊到 "[" 後面那一格
-        parts = [_hanging_indent_json(item, inner_col) for item in obj]
-        sep = ",\n" + " " * inner_col
-        return "[" + sep.join(parts) + "]"
- 
-    return json.dumps(obj, ensure_ascii=False)
- #--------------------------------------------------------------------
-def make_jsonable(obj):
-    #LangChain Message
-    if isinstance(obj, BaseMessage):
-        return message_to_dict(obj)
-
-    #pydantic BaseModel (Action、BoundsXY)
-    if isinstance(obj, BaseModel):
-        return make_jsonable(obj.model_dump())
-
-    # dataclass
-    if is_dataclass(obj):
-        return make_jsonable(asdict(obj))
-
-    #dict
-    if isinstance(obj, dict):
-        return {k: make_jsonable(v) for k, v in obj.items()}
-
-    #list / tuple
-    if isinstance(obj, list):
-        return [make_jsonable(v) for v in obj]
-
-    return obj

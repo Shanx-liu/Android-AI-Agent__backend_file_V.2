@@ -116,6 +116,9 @@ class ConnectionManager:     #全域的狀態共享中心，為"邏輯層"與"�
         while True:
             data: dict = await self._message_queue.get()
             if data.get("type") == expected_type:       #取出符合 type 值的訊息
+                if data.get("type") == "ui_screen_data":    #不把UI Tree與截圖資料印出來
+                    print(colorama.Fore.BLUE + f"type: {data.get('type')}   sent_time: {data.get('sent_time')}")
+                    return data
                 print(colorama.Fore.BLUE + f"{data}")
                 return data
             else:

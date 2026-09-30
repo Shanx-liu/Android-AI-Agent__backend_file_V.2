@@ -3,6 +3,13 @@ from fastapi import WebSocket, FastAPI
 from Connection_Manager import manager
 import colorama
 
+# 要在最上面就啟用，這樣連後面 import 其他模組時印出來的東西都會被記錄到
+from logging_utils import enable_terminal_capture
+enable_terminal_capture("terminal_output.log")
+
+import warnings     #過濾掉pydantic的警告
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings")
+
 #----------------------------此檔案為通訊層-------------------------------------
 
 #用WebSocket時，網址開頭要是 ws:// 或 wss://
